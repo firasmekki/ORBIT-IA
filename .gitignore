@@ -1,0 +1,30 @@
+# Real secrets - never commit. Only .env.example (placeholders) is tracked.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.venvcheck*/
+*.egg-info/
+
+# Node / frontend build
+node_modules/
+frontend/dist/
+frontend/build/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code local harness state (not project config)
+.claude/
+
+# Logs / local scratch
+*.log
+*.tmp

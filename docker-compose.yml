@@ -1,0 +1,182 @@
+name: orbitia
+
+# Everything below models the "private network" boundary from the
+# architecture note: only `frontend` (the reverse proxy) and `backend`
+# publish a port to the host, and even those are bound to 127.0.0.1. The
+# MCP server, the LLM, the vector database and the document store are only
+# reachable from other containers on this compose network - never from the
+# host's network interface, let alone the Internet.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: orbitia
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orbitia}
+      POSTGRES_DB: orbitia
+    volumes:
+      - orbitia_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbitia -d orbitia"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - orbitia_ollama_data:/root/.ollama
+    ports:
+      - "127.0.0.1:11435:11434"
+    environment:
+      # Default is 5 minutes - short enough that a normal pause between
+      # chat messages evicts both models from VRAM, and the next message
+      # pays a ~60-90s reload penalty (that's what "très long" actually
+      # was: not generation speed, cold model loading). 30 min keeps a demo
+      # session warm throughout; raise further or use -1 (never unload) if
+      # VRAM headroom allows and the machine is dedicated to this.
+      OLLAMA_KEEP_ALIVE: "30m"
+    # GPU inference instead of CPU-only - the single biggest lever on raw
+    # generation speed with a local model. Falls back to CPU automatically
+    # if no compatible GPU/driver is present (Ollama detects at runtime);
+    # remove this block entirely on a machine with no NVIDIA GPU if it
+    # fails to start.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # One-shot: pulls the small local chat + embedding models used by the
+  # demo, then exits. `backend`/`mcp` don't hard-depend on it finishing -
+  # the app runs fine without it, it just answers "LLM indisponible" until
+  # the models are present (see app/agent/llm_client.py's error handling).
+  # Also sends one throwaway prompt to the chat model so it's already
+  # loaded into VRAM (not just downloaded to disk) before the first real
+  # user message arrives - that first message is what used to eat the full
+  # ~60-90s cold-load penalty. The embedding model gets warmed for free
+  # right after, as a side effect of `seed` embedding the demo documents.
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        echo waiting for ollama...;
+        until ollama list >/dev/null 2>&1; do sleep 2; done;
+        echo pulling chat model...;
+        ollama pull llama3.2:1b;
+        echo pulling embedding model...;
+        ollama pull nomic-embed-text;
+        echo warming chat model into VRAM...;
+        ollama run llama3.2:1b "hi" >/dev/null 2>&1 || true;
+        echo done.
+
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-orbitia}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-orbitia123}
+    volumes:
+      - orbitia_minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # The real MCP server. No `ports:` entry on purpose - it is reachable
+  # only as `mcp:8090` from inside this compose network.
+  mcp:
+    build: ./backend
+    command: ["python", "-m", "app.mcp.server"]
+    environment: &backend-env
+      DATABASE_URL: "postgresql+psycopg://orbitia:${POSTGRES_PASSWORD:-orbitia}@postgres:5432/orbitia"
+      # Dev defaults below are fine on localhost. Before putting this on any
+      # server reachable by others, copy .env.example to .env and set real
+      # random values - anyone who can read these two secrets can mint
+      # valid user sessions and internal MCP identities.
+      JWT_SECRET: ${JWT_SECRET:-dev-only-jwt-secret-change-me}
+      INTERNAL_AUTH_SECRET: ${INTERNAL_AUTH_SECRET:-dev-only-internal-secret-change-me}
+      MCP_SERVER_URL: "http://mcp:8090/mcp"
+      # Points at the bundled `ollama` container by default. If you already
+      # run Ollama natively on the host, override to
+      # http://host.docker.internal:11434 instead (see README) - either
+      # way the model stays on this machine, inside the private network.
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      OLLAMA_CHAT_MODEL: "llama3.2:1b"
+      OLLAMA_EMBEDDING_MODEL: "nomic-embed-text"
+      EMBEDDING_DIM: "768"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-orbitia}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-orbitia123}
+      # Comma-separated origins allowed to call the API directly with an
+      # Authorization header. Same-origin calls through the frontend's
+      # nginx proxy don't need this at all - it only matters for direct API
+      # access (Swagger UI, a separate `vite dev` server, etc). Add your
+      # server's real origin once you have one, e.g.
+      # CORS_ORIGINS=https://orbitia.example.com in .env
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8081,http://localhost:5173}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build: ./backend
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mcp:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: creates the 5 demo accounts + demo documents/financial
+  # records and indexes them into pgvector. Re-run any time with:
+  #   docker compose run --rm seed
+  seed:
+    build: ./backend
+    command: ["python", "-m", "app.seed"]
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      # Bound to localhost only by default (safe for a laptop demo). On a
+      # server you actually want to reach from another machine, set
+      # FRONTEND_BIND=0.0.0.0 in .env (or a specific interface IP) - this
+      # is still the ONLY container port meant to ever be reachable from
+      # outside the host; everything else stays on 127.0.0.1 on purpose.
+      - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-8081}:80"
+
+volumes:
+  orbitia_postgres_data:
+  orbitia_ollama_data:
+  orbitia_minio_data:

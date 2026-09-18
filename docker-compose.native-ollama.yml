@@ -1,0 +1,35 @@
+# Optional overlay: use an Ollama instance already running natively on the
+# host instead of the bundled `ollama` container - useful if you already
+# have models pulled locally. Data still never leaves this machine either
+# way; this only changes which process serves the model.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.native-ollama.yml up -d
+#
+# Adjust OLLAMA_CHAT_MODEL / OLLAMA_EMBEDDING_MODEL below to whatever you
+# already have pulled (`ollama list` on the host to check).
+
+services:
+  backend:
+    environment:
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      OLLAMA_CHAT_MODEL: "qwen2.5:1.5b"
+      OLLAMA_EMBEDDING_MODEL: "nomic-embed-text"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  mcp:
+    environment:
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      OLLAMA_CHAT_MODEL: "qwen2.5:1.5b"
+      OLLAMA_EMBEDDING_MODEL: "nomic-embed-text"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  seed:
+    environment:
+      OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      OLLAMA_CHAT_MODEL: "qwen2.5:1.5b"
+      OLLAMA_EMBEDDING_MODEL: "nomic-embed-text"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
