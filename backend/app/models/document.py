@@ -50,3 +50,34 @@ class DocumentChunk(Base):
     embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dim), nullable=False)
 
     document: Mapped["Document"] = relationship(back_populates="chunks")
+
+
+class DocumentPage(Base):
+    """Non-overlapping, page/section-addressable plain text, kept separate
+    from `DocumentChunk` on purpose: RAG chunks overlap by design (better
+    semantic recall), which would double-count any exact keyword search run
+    against them. This table is the source of truth for search_keyword and
+    get_document_section - never touched by the embedding pipeline.
+
+    `page_no` is set for real paginated formats (PDF); `section` is set for
+    formats addressed by heading/block instead (DOCX/MD/TXT/XLSX) - see
+    app/rag/extract.py for how each format is split. `line_offset` is the
+    1-indexed line number, within `text`, that line 1 of this page/section
+    corresponds to in the document's original extracted text - lets
+    search_keyword report a line number that means something to a human
+    re-opening the source file.
+    """
+
+    __tablename__ = "document_pages"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    page_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    section: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    line_offset: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+
+    document: Mapped["Document"] = relationship()
