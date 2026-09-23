@@ -17,6 +17,7 @@ revocation) takes effect on the very next tool call, no new token needed.
 
 import re
 import uuid
+from datetime import datetime, timedelta
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
@@ -36,14 +37,16 @@ from app.rag.retriever import retrieve_with_out_of_scope_signal
 from app.rag.search_keyword import build_pattern, find_matches, is_arabic_keyword
 
 MAX_LOCATIONS_PER_DOCUMENT = 5
+MAX_LIST_RESULTS = 200
 
 mcp_app = FastMCP(
     name="orbitia-mcp",
     instructions=(
         "Internal Orbitia company tools: search_documents, get_document, "
-        "search_database, get_company_information. Every call is scoped to "
-        "the authenticated caller resolved server-side; there is no user_id "
-        "or identity argument on any tool."
+        "search_database, get_company_information, search_keyword, "
+        "list_documents. Every call is scoped to the authenticated caller "
+        "resolved server-side; there is no user_id or identity argument on "
+        "any tool."
     ),
     host="0.0.0.0",
     port=8090,
@@ -309,6 +312,96 @@ def _search_keyword_impl(user_id: str, keyword: str, whole_word: bool) -> dict:
         db.close()
 
 
+def _list_documents_impl(
+    user_id: str,
+    document_type: str | None,
+    department: str | None,
+    date_min: str | None,
+    date_max: str | None,
+    author: str | None,
+) -> dict:
+    db = SessionLocal()
+    try:
+        user, grant = _load_user_and_grant(db, user_id)
+        decision = check_tool_access(grant=grant, tool_name="list_documents")
+        if not decision.allowed:
+            _audit(db, user=user, role=grant.role if grant else None, action="MCP_LIST_DOCUMENTS", decision="DENY", reason=decision.reason)
+            return {"error": decision.reason}
+
+        filters = {
+            "document_type": document_type,
+            "department": department,
+            "date_min": date_min,
+            "date_max": date_max,
+            "author": author,
+        }
+        departments, max_rank = retrieval_scope(grant=grant)
+        if not departments:
+            _audit(db, user=user, role=grant.role, action="MCP_LIST_DOCUMENTS", decision="ALLOW", reason="ok", extra={"filters": filters, "result_count": 0})
+            return {"results": []}
+
+        scoped_departments = departments
+        if department:
+            if department not in departments:
+                # Requested a department outside this role's scope: same
+                # "never confirm or deny what exists elsewhere" principle as
+                # search_keyword's restricted_match - silently empty rather
+                # than a 403, no signal about whether anything is there.
+                _audit(db, user=user, role=grant.role, action="MCP_LIST_DOCUMENTS", decision="ALLOW", reason="ok", extra={"filters": filters, "result_count": 0})
+                return {"results": []}
+            scoped_departments = {department}
+
+        query = (
+            db.query(Document, User)
+            .outerjoin(User, User.id == Document.owner_id)
+            .filter(Document.department.in_(scoped_departments), Document.confidentiality_rank <= max_rank)
+        )
+        try:
+            if date_min:
+                query = query.filter(Document.created_at >= datetime.fromisoformat(date_min))
+            if date_max:
+                query = query.filter(Document.created_at < datetime.fromisoformat(date_max) + timedelta(days=1))
+        except ValueError:
+            return {"error": "format de date invalide, utilisez AAAA-MM-JJ"}
+
+        rows = query.order_by(Document.created_at.desc()).limit(MAX_LIST_RESULTS).all()
+
+        results = []
+        normalized_type = document_type.lower().lstrip(".") if document_type else None
+        normalized_author = normalize(author) if author else None
+        for doc, owner in rows:
+            ext = doc.source_filename.rsplit(".", 1)[-1].lower() if doc.source_filename and "." in doc.source_filename else None
+            if normalized_type and ext != normalized_type:
+                continue
+            author_name = owner.full_name if owner else None
+            if normalized_author and (not author_name or normalized_author not in normalize(author_name)):
+                continue
+            results.append(
+                {
+                    "document_id": str(doc.id),
+                    "title": doc.title,
+                    "department": doc.department,
+                    "confidentiality": doc.confidentiality,
+                    "type": ext,
+                    "author": author_name,
+                    "created_at": doc.created_at.isoformat(),
+                }
+            )
+
+        _audit(
+            db,
+            user=user,
+            role=grant.role,
+            action="MCP_LIST_DOCUMENTS",
+            decision="ALLOW",
+            reason="ok",
+            extra={"filters": filters, "result_count": len(results)},
+        )
+        return {"results": results}
+    finally:
+        db.close()
+
+
 _STOPWORDS = {
     "le", "la", "les", "un", "une", "des", "de", "du", "quel", "quelle", "quels", "quelles",
     "est", "sont", "pour", "avec", "dans", "sur", "moi", "donne", "montre", "quelle", "que",
@@ -433,6 +526,28 @@ async def search_keyword(keyword: str, ctx: Context, whole_word: bool = True) ->
     except IdentityError as exc:
         return {"error": str(exc)}
     return await anyio.to_thread.run_sync(_search_keyword_impl, identity.user_id, keyword, whole_word)
+
+
+@mcp_app.tool()
+async def list_documents(
+    ctx: Context,
+    document_type: str | None = None,
+    department: str | None = None,
+    date_min: str | None = None,
+    date_max: str | None = None,
+    author: str | None = None,
+) -> dict:
+    """List internal documents the caller is authorized to see, optionally
+    filtered by file type (pdf/xlsx/docx/txt/md), department, creation date
+    range (ISO AAAA-MM-JJ), and author. A department outside the caller's
+    access returns an empty list, not an error."""
+    try:
+        identity = extract_identity(ctx)
+    except IdentityError as exc:
+        return {"error": str(exc)}
+    return await anyio.to_thread.run_sync(
+        _list_documents_impl, identity.user_id, document_type, department, date_min, date_max, author
+    )
 
 
 @mcp_app.tool()

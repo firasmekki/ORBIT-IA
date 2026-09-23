@@ -31,19 +31,28 @@ ROLE_ACCESS: dict[str, dict] = {
 }
 
 ALL_TOOLS: frozenset[str] = frozenset(
-    {"search_documents", "get_document", "search_database", "get_company_information", "search_keyword"}
+    {
+        "search_documents",
+        "get_document",
+        "search_database",
+        "get_company_information",
+        "search_keyword",
+        "list_documents",
+    }
 )
+
+_BASE_TOOLS = {"search_documents", "get_document", "get_company_information", "search_keyword", "list_documents"}
 
 # role -> MCP tools it is even allowed to invoke. A tool absent from a
 # role's set is not offered to the LLM for that session at all - there is
 # nothing for the model to be refused, because it was never given the
 # option to call it (least privilege at the tool-catalog level).
 ROLE_TOOLS: dict[str, set[str]] = {
-    "DIRECTOR": {"search_documents", "get_document", "search_database", "get_company_information", "search_keyword"},
-    "HR": {"search_documents", "get_document", "get_company_information", "search_keyword"},
-    "ACCOUNTANT": {"search_documents", "get_document", "search_database", "get_company_information", "search_keyword"},
-    "DEVELOPER": {"search_documents", "get_document", "get_company_information", "search_keyword"},
-    "EMPLOYEE": {"search_documents", "get_document", "get_company_information", "search_keyword"},
+    "DIRECTOR": _BASE_TOOLS | {"search_database"},
+    "HR": set(_BASE_TOOLS),
+    "ACCOUNTANT": _BASE_TOOLS | {"search_database"},
+    "DEVELOPER": set(_BASE_TOOLS),
+    "EMPLOYEE": set(_BASE_TOOLS),
 }
 
 
