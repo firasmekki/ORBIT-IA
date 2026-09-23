@@ -20,9 +20,16 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-os.environ.setdefault(
-    "DATABASE_URL",
-    os.environ.get("TEST_DATABASE_URL", "postgresql+psycopg://orbitia:orbitia@localhost:5432/orbitia_test"),
+# Unconditional override, NOT setdefault: when this suite runs via
+# `docker compose run backend ...`, DATABASE_URL is already set in the
+# container's environment (the &backend-env anchor in docker-compose.yml
+# points it at the real demo database) - setdefault would then silently
+# keep that value, and every test's TRUNCATE in the `db` fixture below
+# would wipe the real orbitia database instead of orbitia_test. This
+# happened once already; the check right below is the second line of
+# defense in case this override is ever bypassed some other way.
+os.environ["DATABASE_URL"] = os.environ.get(
+    "TEST_DATABASE_URL", "postgresql+psycopg://orbitia:orbitia@localhost:5432/orbitia_test"
 )
 
 from app.core.migrations import bootstrap_schema  # noqa: E402
@@ -31,6 +38,13 @@ from app.models.document import CONFIDENTIALITY_RANK, Document, DocumentPage  # 
 from app.models.user import User  # noqa: E402
 
 TEST_DATABASE_URL = os.environ["DATABASE_URL"]
+
+if not TEST_DATABASE_URL.rsplit("/", 1)[-1].startswith("orbitia_test"):
+    raise RuntimeError(
+        f"Refusing to run tests against {TEST_DATABASE_URL!r}: this suite TRUNCATEs its tables "
+        "after every test, and the database name doesn't look like a test database (expected it "
+        "to start with 'orbitia_test'). Set TEST_DATABASE_URL explicitly if this is intentional."
+    )
 
 
 @pytest.fixture(scope="session")
@@ -58,7 +72,7 @@ def db(engine):
     session.close()
 
 
-def make_document(db, *, title, department, confidentiality, pages, owner_id=None):
+def make_document(db, *, title, department, confidentiality, pages, owner_id=None, source_filename=None, created_at=None):
     """`pages`: list of (page_no, section, line_offset, text) tuples."""
     content = "\n\n".join(p[3] for p in pages)
     doc = Document(
@@ -68,7 +82,10 @@ def make_document(db, *, title, department, confidentiality, pages, owner_id=Non
         confidentiality_rank=CONFIDENTIALITY_RANK[confidentiality],
         content=content,
         owner_id=owner_id,
+        source_filename=source_filename,
     )
+    if created_at is not None:
+        doc.created_at = created_at
     db.add(doc)
     db.commit()
     db.refresh(doc)
