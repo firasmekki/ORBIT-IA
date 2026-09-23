@@ -19,6 +19,8 @@ phrasing still works as long as the keyword itself is quoted.
 import re
 from dataclasses import dataclass
 
+from app.rag.normalize import normalize
+
 _QUOTED = re.compile(r"[\"'«»](.+?)[\"'»]")
 # Single token only for unquoted extraction - deliberately not multi-word:
 # with no closing delimiter to bound it, a greedy multi-word capture eats
@@ -81,3 +83,81 @@ def detect_keyword_intent(message: str) -> KeywordIntent | None:
             if keyword:
                 return KeywordIntent(keyword=keyword)
     return None
+
+
+# --- list_documents intent -------------------------------------------------
+
+_LIST_TRIGGER = re.compile(
+    r"\b(?:liste|listes?|montre(?:-moi)?|affiche(?:-moi)?|quels?\s+sont)\b.*\bdocuments?\b", re.IGNORECASE
+)
+
+# Normalized (accent/case-folded via app.rag.normalize) French synonym ->
+# department code. Matched as whole words against the normalized message,
+# not the department codes themselves (a user says "les documents RH", not
+# "les documents HR").
+_DEPARTMENT_SYNONYMS = {
+    "rh": "HR",
+    "ressources humaines": "HR",
+    "hr": "HR",
+    "finance": "FINANCE",
+    "financier": "FINANCE",
+    "financiers": "FINANCE",
+    "comptabilite": "FINANCE",
+    "tech": "TECH",
+    "technique": "TECH",
+    "informatique": "TECH",
+    "it": "TECH",
+    "general": "GENERAL",
+    "generale": "GENERAL",
+    "generaux": "GENERAL",
+    "exec": "EXEC",
+    "direction": "EXEC",
+    "executif": "EXEC",
+}
+
+_AUTHOR_RE = re.compile(r"\b(?:de|par)\s+([A-ZÀ-Ý][\wÀ-ÿ\-]+(?:\s+[A-ZÀ-Ý][\wÀ-ÿ\-]+)?)")
+_DATE_TOKEN = r"(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})"
+_DATE_MIN_RE = re.compile(rf"(?:depuis|apr[eè]s)\s+(?:le\s+)?{_DATE_TOKEN}", re.IGNORECASE)
+_DATE_MAX_RE = re.compile(rf"avant\s+(?:le\s+)?{_DATE_TOKEN}", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ListDocumentsIntent:
+    department: str | None = None
+    author: str | None = None
+    date_min: str | None = None
+    date_max: str | None = None
+
+
+def _date_to_iso(date_str: str) -> str:
+    if "/" in date_str:
+        day, month, year = date_str.split("/")
+        return f"{year}-{int(month):02d}-{int(day):02d}"
+    return date_str
+
+
+def detect_list_documents_intent(message: str) -> ListDocumentsIntent | None:
+    """Best-effort filter extraction, same spirit as detect_keyword_intent -
+    a filter that isn't recognized is just left unset (broader results),
+    never a reason to fail the whole intent: `list_documents` with fewer
+    filters than the user meant is a minor inconvenience, not a correctness
+    bug the way a miscounted keyword would be."""
+    if not _LIST_TRIGGER.search(message):
+        return None
+
+    normalized_message = normalize(message)
+    department = None
+    for synonym, code in _DEPARTMENT_SYNONYMS.items():
+        if re.search(rf"\b{re.escape(synonym)}\b", normalized_message):
+            department = code
+            break
+
+    author_match = _AUTHOR_RE.search(message)
+    author = author_match.group(1).strip(_STRIP_CHARS) if author_match else None
+
+    date_min_match = _DATE_MIN_RE.search(message)
+    date_min = _date_to_iso(date_min_match.group(1)) if date_min_match else None
+    date_max_match = _DATE_MAX_RE.search(message)
+    date_max = _date_to_iso(date_max_match.group(1)) if date_max_match else None
+
+    return ListDocumentsIntent(department=department, author=author, date_min=date_min, date_max=date_max)

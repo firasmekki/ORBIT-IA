@@ -15,7 +15,7 @@ Security invariants enforced here:
 import json
 from dataclasses import dataclass, field
 
-from app.agent.intent import detect_keyword_intent
+from app.agent.intent import detect_keyword_intent, detect_list_documents_intent
 from app.agent.llm_client import LLMServiceError, chat_completion
 from app.agent.mcp_client import call_tool, open_mcp_session
 from app.core.security import mint_internal_token
@@ -109,6 +109,27 @@ TOOL_DEFINITIONS: dict[str, dict] = {
             },
         },
     },
+    "list_documents": {
+        "type": "function",
+        "function": {
+            "name": "list_documents",
+            "description": (
+                "Liste les documents internes autorisés, avec filtres optionnels "
+                "(type de fichier, département, date, auteur)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_type": {"type": "string", "description": "pdf, xlsx, docx, txt ou md"},
+                    "department": {"type": "string", "description": "HR, FINANCE, TECH, GENERAL ou EXEC"},
+                    "date_min": {"type": "string", "description": "Date minimale (AAAA-MM-JJ)"},
+                    "date_max": {"type": "string", "description": "Date maximale (AAAA-MM-JJ)"},
+                    "author": {"type": "string", "description": "Nom de l'auteur"},
+                },
+                "required": [],
+            },
+        },
+    },
 }
 
 SYSTEM_PROMPT = """Tu es l'assistant IA interne d'Orbitia. Tu réponds aux employés en te \
@@ -161,6 +182,11 @@ async def run_agent_turn(*, user_id: str, grant: Grant, message: str, history: l
                     return await _run_search_keyword(
                         session, keyword_intent.keyword, keyword_intent.whole_word, tool_trace
                     )
+
+            if "list_documents" in grant.tools:
+                list_intent = detect_list_documents_intent(message)
+                if list_intent is not None:
+                    return await _run_list_documents(session, list_intent, tool_trace)
 
             early_result = await _ground_with_search(session, message, tool_trace, sources_by_doc, messages)
             if early_result is not None:
@@ -456,6 +482,58 @@ def _format_keyword_result(result: dict) -> str:
             lines.append(f"  • {where}, l.{loc['line']} : …{loc['excerpt']}…")
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+async def _run_list_documents(session, intent, tool_trace: list[dict]) -> AgentTurnResult:
+    """Same fully-deterministic contract as _run_search_keyword: the LLM
+    never sees this message, the list is built and formatted in Python."""
+    arguments = {
+        "document_type": None,
+        "department": intent.department,
+        "date_min": intent.date_min,
+        "date_max": intent.date_max,
+        "author": intent.author,
+    }
+    result = await call_tool(session, "list_documents", arguments)
+    decision = "DENY" if "error" in result else "ALLOW"
+    tool_trace.append({"tool": "list_documents", "arguments": arguments, "decision": decision, "reason": result.get("error", "ok")})
+
+    if decision == "DENY":
+        if result.get("service_unavailable"):
+            return AgentTurnResult(
+                answer="Le service de documents est momentanément indisponible. Réessayez dans un instant.",
+                tool_trace=tool_trace,
+                degraded=True,
+            )
+        return AgentTurnResult(answer=f"Accès refusé : {result['error']}", tool_trace=tool_trace, degraded=True)
+
+    sources = [
+        {
+            "document_id": doc["document_id"],
+            "title": doc["title"],
+            "department": doc["department"],
+            "confidentiality": doc["confidentiality"],
+            "excerpt": "",
+        }
+        for doc in result["results"]
+    ]
+    return AgentTurnResult(answer=_format_list_documents_result(result), sources=sources, tool_trace=tool_trace)
+
+
+def _format_list_documents_result(result: dict) -> str:
+    docs = result["results"]
+    if not docs:
+        return "Aucun document trouvé pour ces critères, dans les documents auxquels vous avez accès."
+
+    lines = [f"{len(docs)} document(s) trouvé(s) :", ""]
+    for doc in docs:
+        type_label = f" ({doc['type']})" if doc["type"] else ""
+        author_label = f" — {doc['author']}" if doc["author"] else ""
+        date_label = doc["created_at"][:10]
+        lines.append(
+            f"- {doc['title']}{type_label} — {doc['department']} / {doc['confidentiality']}{author_label} — {date_label}"
+        )
+    return "\n".join(lines)
 
 
 def _contains_llm_error(exc: BaseException) -> bool:
