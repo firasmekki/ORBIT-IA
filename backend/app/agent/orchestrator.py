@@ -15,6 +15,7 @@ Security invariants enforced here:
 import json
 from dataclasses import dataclass, field
 
+from app.agent.intent import detect_keyword_intent
 from app.agent.llm_client import LLMServiceError, chat_completion
 from app.agent.mcp_client import call_tool, open_mcp_session
 from app.core.security import mint_internal_token
@@ -86,6 +87,28 @@ TOOL_DEFINITIONS: dict[str, dict] = {
             },
         },
     },
+    "search_keyword": {
+        "type": "function",
+        "function": {
+            "name": "search_keyword",
+            "description": (
+                "Compte les occurrences exactes d'un mot ou terme dans les documents internes "
+                "autorisés (insensible à la casse et aux accents)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "Le mot ou terme exact à rechercher"},
+                    "whole_word": {
+                        "type": "boolean",
+                        "description": "Mot entier (true) ou sous-chaîne (false)",
+                        "default": True,
+                    },
+                },
+                "required": ["keyword"],
+            },
+        },
+    },
 }
 
 SYSTEM_PROMPT = """Tu es l'assistant IA interne d'Orbitia. Tu réponds aux employés en te \
@@ -132,6 +155,13 @@ async def run_agent_turn(*, user_id: str, grant: Grant, message: str, history: l
 
     try:
         async with open_mcp_session(internal_token) as session:
+            if "search_keyword" in grant.tools:
+                keyword_intent = detect_keyword_intent(message)
+                if keyword_intent is not None:
+                    return await _run_search_keyword(
+                        session, keyword_intent.keyword, keyword_intent.whole_word, tool_trace
+                    )
+
             early_result = await _ground_with_search(session, message, tool_trace, sources_by_doc, messages)
             if early_result is not None:
                 return early_result
@@ -345,6 +375,87 @@ async def _ground_with_database(
             }
         )
     return None
+
+
+async def _run_search_keyword(session, keyword: str, whole_word: bool, tool_trace: list[dict]) -> AgentTurnResult:
+    """Fully deterministic path for exact-count questions (see
+    app/agent/intent.py): the LLM is never invoked, not even to phrase the
+    result - every number in the answer comes straight from
+    app/rag/search_keyword.py's exact regex count, formatted in Python.
+    Runs before any LLM call, so it also works unchanged when Ollama is
+    down (search_keyword has no LLM/embedding dependency at all)."""
+    result = await call_tool(session, "search_keyword", {"keyword": keyword, "whole_word": whole_word})
+    decision = "DENY" if "error" in result else "ALLOW"
+    tool_trace.append(
+        {
+            "tool": "search_keyword",
+            "arguments": {"keyword": keyword, "whole_word": whole_word},
+            "decision": decision,
+            "reason": result.get("error", "ok"),
+        }
+    )
+    if decision == "DENY":
+        if result.get("service_unavailable"):
+            return AgentTurnResult(
+                answer=(
+                    "Le service de recherche interne est momentanément indisponible. "
+                    "Réessayez dans un instant - ceci n'est pas un refus de permission."
+                ),
+                tool_trace=tool_trace,
+                degraded=True,
+            )
+        return AgentTurnResult(answer=f"Accès refusé : {result['error']}", tool_trace=tool_trace, degraded=True)
+
+    restricted_match = result.get("restricted_match")
+    if restricted_match:
+        # Same silent-leak signal as _ground_with_search's restricted_match
+        # handling: a synthetic DENY trace entry, never surfaced in the
+        # visible answer (see _format_keyword_result's 0-result branch),
+        # picked up by routers/chat.py to raise a Director-facing alert.
+        tool_trace.append(
+            {
+                "tool": "search_keyword",
+                "arguments": {"keyword": keyword, "whole_word": whole_word},
+                "decision": "DENY",
+                "reason": (
+                    f"a match exists in department {restricted_match['department']} "
+                    f"at level {restricted_match['confidentiality']}, outside this role's access"
+                ),
+            }
+        )
+
+    sources = [
+        {
+            "document_id": doc["document_id"],
+            "title": doc["title"],
+            "department": doc["department"],
+            "confidentiality": doc["confidentiality"],
+            "excerpt": doc["locations"][0]["excerpt"] if doc["locations"] else "",
+        }
+        for doc in result["documents"]
+    ]
+    return AgentTurnResult(answer=_format_keyword_result(result), sources=sources, tool_trace=tool_trace)
+
+
+def _format_keyword_result(result: dict) -> str:
+    keyword = result["keyword"]
+    total = result["total_count"]
+    if total == 0:
+        # Byte-for-byte identical whether or not a match exists outside the
+        # caller's access (restricted_match) - the only thing that differs
+        # is the DENY trace entry appended above, which never reaches this
+        # text. A varying message here would itself be the leak.
+        return f"Aucune occurrence de « {keyword} » trouvée dans les documents auxquels vous avez accès."
+
+    docs = result["documents"]
+    lines = [f"« {keyword} » apparaît {total} fois dans {len(docs)} document(s) :", ""]
+    for doc in docs:
+        lines.append(f"{doc['title']} — {doc['count']} occurrence(s)")
+        for loc in doc["locations"]:
+            where = f"p.{loc['page']}" if loc["page"] else (loc["section"] or "")
+            lines.append(f"  • {where}, l.{loc['line']} : …{loc['excerpt']}…")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def _contains_llm_error(exc: BaseException) -> bool:
