@@ -529,6 +529,10 @@ label.field-label {
   background: var(--deny-bg);
   color: var(--deny);
 }
+.badge-system {
+  background: #eceef1;
+  color: #4a525c;
+}
 
 .dept-tag {
   font-size: 11px;

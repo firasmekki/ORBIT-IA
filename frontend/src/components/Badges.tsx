@@ -17,6 +17,9 @@ export function ConfidentialityBadge({ level }: { level: string }) {
 }
 
 export function DecisionBadge({ decision }: { decision: 'ALLOW' | 'DENY' | string }) {
+  if (decision !== 'ALLOW' && decision !== 'DENY') {
+    return <span className="badge badge-system">Système</span>
+  }
   return (
     <span className={decision === 'ALLOW' ? 'badge badge-allow' : 'badge badge-deny'}>
       {decision === 'ALLOW' ? 'Autorisé' : 'Refusé'}
