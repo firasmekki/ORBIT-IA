@@ -16,3 +16,21 @@ story and the defenses now in place (a dedicated `orbitia_test` role with
 no access to the real database, a low-privilege `orbitia_app` role with no
 `TRUNCATE`/DDL rights at all, automatic backups). Those defenses make a
 repeat harder, but they are not a substitute for checking first.
+
+## Never run a command that can discard uncommitted work without asking first
+
+This means `git stash`, `git reset`, `git checkout -- <file>` /
+`git restore` on modified files, `rm` on anything not created this
+session, and anything else that overwrites or discards working-tree
+changes - whether the changes are mine or were already there before I
+started. If I need to test something against a clean state, ask first, or
+use a separate worktree/clone instead of touching the working tree that
+still has uncommitted changes in it.
+
+## Never modify or delete an existing audit_logs row, for any reason
+
+Not even to fix a typo. The audit log is immutable by principle (also
+enforced at the database level - see `orbitia_app`'s grants in
+`app/core/migrations.py`, which only allow `INSERT`/`SELECT` on this
+table). If an entry needs correcting or annotating, add a new row that
+references the old one - never `UPDATE`/`DELETE` the original.
