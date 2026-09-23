@@ -32,6 +32,14 @@ class Message(Base):
     sources: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     # tool call trace for this turn: [{tool, arguments, decision, reason}, ...]
     tool_trace: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # Structured result of this turn's deterministic tool call, if any - lets
+    # a later turn resolve "la première occurrence" / "ce document" / "le
+    # deuxième" / "suite" without re-parsing this message's rendered text
+    # (see app/agent/intent.py's follow-up detection and
+    # app/agent/orchestrator.py's _resolve_document_section_request). Never
+    # exposed to the frontend - internal continuity only. Its "kind" is one
+    # of "keyword_search" | "document_choice" | "document_section".
+    reference_context: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")

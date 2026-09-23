@@ -38,10 +38,18 @@ ALL_TOOLS: frozenset[str] = frozenset(
         "get_company_information",
         "search_keyword",
         "list_documents",
+        "get_document_section",
     }
 )
 
-_BASE_TOOLS = {"search_documents", "get_document", "get_company_information", "search_keyword", "list_documents"}
+_BASE_TOOLS = {
+    "search_documents",
+    "get_document",
+    "get_company_information",
+    "search_keyword",
+    "list_documents",
+    "get_document_section",
+}
 
 # role -> MCP tools it is even allowed to invoke. A tool absent from a
 # role's set is not offered to the LLM for that session at all - there is

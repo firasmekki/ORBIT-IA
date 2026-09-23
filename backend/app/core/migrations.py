@@ -59,6 +59,20 @@ def bootstrap_schema(conn: Connection) -> None:
         )
     )
 
+    # get_document_section follow-up resolution (app/agent/intent.py /
+    # orchestrator.py) - structured continuity between turns, see the
+    # Message model's docstring for the shape.
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reference_context JSONB"))
+
+    # Case/accent-insensitive exact-then-partial title lookup for
+    # get_document_section's document_name resolution.
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_documents_title_trgm ON documents "
+            "USING gin (title gin_trgm_ops)"
+        )
+    )
+
 
 def bootstrap_roles_and_grants(conn: Connection, settings: Settings) -> None:
     """Creates/refreshes `orbitia_app`, the low-privilege role the running

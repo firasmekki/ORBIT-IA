@@ -23,6 +23,7 @@ import anyio
 from mcp.server.fastmcp import Context, FastMCP
 from sqlalchemy import func, or_, true
 
+from app.core.alert_service import create_alert
 from app.core.audit_logger import log_event
 from app.core.database import SessionLocal
 from app.mcp.context import IdentityError, extract_identity
@@ -38,6 +39,15 @@ from app.rag.search_keyword import build_pattern, find_matches, is_arabic_keywor
 
 MAX_LOCATIONS_PER_DOCUMENT = 5
 MAX_LIST_RESULTS = 200
+MAX_SECTION_CHARS = 2000
+MAX_TITLE_CHOICES = 10
+
+# Identical for a nonexistent document_id and one that exists but is
+# outside the caller's grant - see get_document_section's module-level
+# note below for why this has to be byte-for-byte the same everywhere
+# (including the tool_trace decision/reason the end user's own chat UI
+# shows, not just this string).
+DOCUMENT_NOT_FOUND_OR_DENIED = "document introuvable ou accès non autorisé à cette section"
 
 mcp_app = FastMCP(
     name="orbitia-mcp",
@@ -402,6 +412,160 @@ def _list_documents_impl(
         db.close()
 
 
+def _get_document_section_impl(
+    user_id: str,
+    document_id: str | None,
+    document_name: str | None,
+    page: int | None,
+    section: str | None,
+    offset: int,
+) -> dict:
+    """Security-critical: a nonexistent document_id and one that exists but
+    is outside the caller's grant must be completely indistinguishable to
+    the caller - same error string, same tool_trace decision/reason (the
+    chat UI shows tool_trace to the requester themselves, not just to a
+    Director, so even that has to match). The alert for a genuine denial is
+    raised directly from here (create_alert, same mechanism
+    routers/documents.py's update_document already uses) rather than via
+    routers/chat.py's tool_trace-scanning - that scan can't tell these two
+    DENY entries apart, deliberately, so it can't be what decides whether
+    to page a Director either.
+
+    document_name resolution only ever searches documents already inside
+    `retrieval_scope` - an unauthorized document is never a candidate, so
+    "no match" from that path can only mean "not found among what you can
+    see" and never leaks whether something else matches elsewhere.
+    """
+    db = SessionLocal()
+    try:
+        user, grant = _load_user_and_grant(db, user_id)
+        decision = check_tool_access(grant=grant, tool_name="get_document_section")
+        if not decision.allowed:
+            _audit(db, user=user, role=grant.role if grant else None, action="MCP_GET_DOCUMENT_SECTION", decision="DENY", reason=decision.reason)
+            return {"error": decision.reason}
+
+        if not document_id and not document_name:
+            return {"error": "précisez document_id ou document_name"}
+        if page is None and not section:
+            return {"error": "précisez une page ou une section"}
+
+        departments, max_rank = retrieval_scope(grant=grant)
+
+        doc: Document | None = None
+        if document_id:
+            try:
+                doc_uuid = uuid.UUID(document_id)
+            except ValueError:
+                doc = None
+            else:
+                doc = db.get(Document, doc_uuid)
+        else:
+            normalized_name = normalize(document_name)
+            candidates: list[Document] = []
+            if departments:
+                candidates = (
+                    db.query(Document)
+                    .filter(Document.department.in_(departments), Document.confidentiality_rank <= max_rank)
+                    .all()
+                )
+            exact = [d for d in candidates if normalize(d.title) == normalized_name]
+            partial = [d for d in candidates if normalized_name and normalized_name in normalize(d.title)]
+            matches = exact or partial
+
+            if not matches:
+                _audit(
+                    db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="ALLOW",
+                    reason="ok", extra={"document_name": document_name, "match_count": 0},
+                )
+                return {"error": DOCUMENT_NOT_FOUND_OR_DENIED}
+            if len(matches) > 1:
+                _audit(
+                    db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="ALLOW",
+                    reason="ok", extra={"document_name": document_name, "match_count": len(matches)},
+                )
+                return {
+                    "choices": [{"document_id": str(d.id), "title": d.title} for d in matches[:MAX_TITLE_CHOICES]],
+                    "page": page,
+                    "section": section,
+                }
+            doc = matches[0]
+
+        if doc is None:
+            _audit(
+                db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="DENY",
+                resource_id=document_id, reason="document not found",
+            )
+            return {"error": DOCUMENT_NOT_FOUND_OR_DENIED}
+
+        access_decision = check_document_access(grant=grant, department=doc.department, confidentiality=doc.confidentiality)
+        if not access_decision.allowed:
+            _audit(
+                db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="DENY",
+                resource_type="document", resource_id=str(doc.id), reason=access_decision.reason,
+                extra={"title": doc.title, "department": doc.department, "confidentiality": doc.confidentiality},
+            )
+            create_alert(
+                alert_type="DOCUMENT_ACCESS_DENIED",
+                user_id=user.id,
+                username=user.username,
+                role=user.role,
+                title=f"Tentative d'accès refusée dans l'assistant IA ({user.full_name})",
+                description=(
+                    f"Document visé : « {doc.title} » ({doc.department}/{doc.confidentiality})\n"
+                    f"Refus : {access_decision.reason}"
+                ),
+                resource_type="document",
+                resource_id=str(doc.id),
+            )
+            return {"error": DOCUMENT_NOT_FOUND_OR_DENIED}
+
+        page_query = db.query(DocumentPage).filter(DocumentPage.document_id == doc.id)
+        if page is not None:
+            match = page_query.filter(DocumentPage.page_no == page).first()
+        else:
+            normalized_section = normalize(section)
+            candidates_pages = [p for p in page_query.all() if p.section]
+            exact_pages = [p for p in candidates_pages if normalize(p.section) == normalized_section]
+            partial_pages = [p for p in candidates_pages if normalized_section in normalize(p.section)]
+            found_pages = exact_pages or partial_pages
+            match = found_pages[0] if found_pages else None
+
+        if match is None:
+            _audit(
+                db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="ALLOW",
+                resource_type="document", resource_id=str(doc.id), reason="page/section not found",
+                extra={"title": doc.title, "page": page, "section": section},
+            )
+            where = f"page {page}" if page is not None else f"section « {section} »"
+            return {"error": f"{where} introuvable dans « {doc.title} »"}
+
+        total_length = len(match.text)
+        start = max(0, offset)
+        end = min(total_length, start + MAX_SECTION_CHARS)
+        chunk = match.text[start:end]
+        truncated = end < total_length
+
+        _audit(
+            db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="ALLOW",
+            resource_type="document", resource_id=str(doc.id), reason="ok",
+            extra={"title": doc.title, "page": match.page_no, "section": match.section, "offset": start},
+        )
+        return {
+            "document_id": str(doc.id),
+            "title": doc.title,
+            "department": doc.department,
+            "confidentiality": doc.confidentiality,
+            "page": match.page_no,
+            "section": match.section,
+            "text": chunk,
+            "offset": start,
+            "total_length": total_length,
+            "truncated": truncated,
+        }
+    finally:
+        db.close()
+
+
 _STOPWORDS = {
     "le", "la", "les", "un", "une", "des", "de", "du", "quel", "quelle", "quels", "quelles",
     "est", "sont", "pour", "avec", "dans", "sur", "moi", "donne", "montre", "quelle", "que",
@@ -547,6 +711,32 @@ async def list_documents(
         return {"error": str(exc)}
     return await anyio.to_thread.run_sync(
         _list_documents_impl, identity.user_id, document_type, department, date_min, date_max, author
+    )
+
+
+@mcp_app.tool()
+async def get_document_section(
+    ctx: Context,
+    document_id: str | None = None,
+    document_name: str | None = None,
+    page: int | None = None,
+    section: str | None = None,
+    offset: int = 0,
+) -> dict:
+    """Read one page (PDF) or section (heading/"Bloc N") of an internal
+    document the caller is authorized to see - returns the exact text, not
+    a summary. Identify the document with either `document_id` or
+    `document_name` (exact-then-partial title match among authorized
+    documents; ambiguous names return `choices` to pick from instead of
+    text). Long sections are capped at 2000 characters - pass the returned
+    `offset` back to continue reading. A nonexistent document and an
+    unauthorized one return the identical error, by design."""
+    try:
+        identity = extract_identity(ctx)
+    except IdentityError as exc:
+        return {"error": str(exc)}
+    return await anyio.to_thread.run_sync(
+        _get_document_section_impl, identity.user_id, document_id, document_name, page, section, offset
     )
 
 
