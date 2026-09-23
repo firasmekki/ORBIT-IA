@@ -24,5 +24,11 @@ class DocumentCreate(BaseModel):
     content: str
 
 
+class DocumentUpdate(BaseModel):
+    title: str | None = None
+    department: str | None = None
+    confidentiality: str | None = None
+
+
 class DocumentAccessDenied(BaseModel):
     detail: str = "Accès refusé : vous n'avez pas la permission de consulter ce document."

@@ -34,6 +34,10 @@ export function listDocuments() {
   return api.get<DocumentSummary[]>('/documents')
 }
 
+export function getWatchStatus() {
+  return api.get<{ enabled: boolean; department: string; confidentiality: string }>('/documents/watch-status')
+}
+
 export function getDocument(id: string) {
   return api.get<DocumentDetail>(`/documents/${id}`)
 }
@@ -53,6 +57,13 @@ export function uploadDocument(payload: { title: string; department: string; con
 
 export function downloadDocumentFile(id: string) {
   return api.getBlob(`/documents/${id}/file`)
+}
+
+export function updateDocument(
+  id: string,
+  payload: Partial<{ title: string; department: string; confidentiality: string }>,
+) {
+  return api.patch<DocumentDetail>(`/documents/${id}`, payload)
 }
 
 export function sendChatMessage(message: string, conversationId?: string) {
