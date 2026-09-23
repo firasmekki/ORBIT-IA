@@ -103,6 +103,34 @@ Mot de passe commun : `Demo1234!`
 - **Auth** : JWT maison pour le MVP, pas encore Keycloak/OIDC (voir la note d'architecture pour le plan de bascule).
 - **Policy engine** : règles déclaratives en Python (`app/policy/rules.py`) plutôt que Casbin/OPA - même modèle RBAC+ABAC, implémentation volontairement lisible de bout en bout pour ce prototype.
 
+## Sauvegardes et restauration
+
+Voir [INCIDENTS.md](INCIDENTS.md) pour l'incident qui a motivé cette section - une base de démo entièrement vidée par un bug de test, restaurée avec cette même procédure.
+
+**Sauvegardes automatiques** (aucune action requise) :
+- Avant chaque migration de schéma (démarrage de `backend`, `seed`, `backfill_pages`) - `app/core/migrations.py::run_privileged_migration`.
+- Une fois par jour via le service `backup` de `docker-compose.yml`.
+- Écrites dans `./backups/` sur l'hôte (format `pg_dump -Fc`, un fichier par sauvegarde), rotation automatique à 7 jours (`BACKUP_RETENTION_DAYS`).
+
+**Sauvegarde manuelle** :
+```bash
+docker compose exec backend python -m app.core.backup manual
+```
+
+**Restauration** (destructive - écrase la base cible - à réserver à une base vide ou à un incident confirmé) :
+```bash
+# 1. Créer/vider la base cible
+docker compose exec postgres psql -U orbitia -d postgres -c "DROP DATABASE IF EXISTS orbitia;" -c "CREATE DATABASE orbitia;"
+
+# 2. Restaurer depuis le dump choisi (liste dans ./backups/)
+docker compose exec -e PGPASSWORD=<POSTGRES_PASSWORD> backend \
+  pg_restore -h postgres -U orbitia -d orbitia --no-owner --no-privileges /backups/orbitia_<nom-du-fichier>.dump
+
+# 3. Redémarrer l'app pour ré-appliquer les rôles/privilèges (orbitia_app, grants) sur les données restaurées
+docker compose up -d --force-recreate backend mcp
+```
+Testé de bout en bout (base vide → restauration → vérification des compteurs de lignes sur toutes les tables) le 2026-09-23, avec `postgresql-client-16` (dépôt PGDG, voir `Dockerfile`) pour une correspondance exacte avec le serveur Postgres 16 - restauration sans le moindre avertissement.
+
 ## Structure
 
 ```
