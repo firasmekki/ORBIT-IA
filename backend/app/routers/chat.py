@@ -68,12 +68,26 @@ async def chat(
         .all()
     )
     history = [{"role": m.role, "content": m.content} for m in reversed(prior)]
+    # Most recent assistant turn's structured result, if any - lets
+    # run_agent_turn resolve "la première occurrence" / "ce document" /
+    # "le deuxième" / "suite" without re-parsing rendered text (see
+    # app/agent/orchestrator.py::_resolve_section_request). Kept out of
+    # `history` on purpose - it's not meant to be seen by the LLM prompt.
+    last_reference_context = next(
+        (m.reference_context for m in prior if m.role == "assistant" and m.reference_context), None
+    )
 
     grant = resolve_effective_grant(user)
     if grant is None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Votre rôle n'est pas reconnu par le système de permissions.")
 
-    result = await run_agent_turn(user_id=str(user.id), grant=grant, message=payload.message, history=history)
+    result = await run_agent_turn(
+        user_id=str(user.id),
+        grant=grant,
+        message=payload.message,
+        history=history,
+        last_reference_context=last_reference_context,
+    )
 
     assistant_msg = Message(
         conversation_id=conv.id,
@@ -81,6 +95,7 @@ async def chat(
         content=result.answer,
         sources=result.sources,
         tool_trace=result.tool_trace,
+        reference_context=result.reference_context,
     )
     db.add(assistant_msg)
     db.commit()

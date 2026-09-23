@@ -15,7 +15,7 @@ Security invariants enforced here:
 import json
 from dataclasses import dataclass, field
 
-from app.agent.intent import detect_keyword_intent, detect_list_documents_intent
+from app.agent.intent import SectionRequest, detect_keyword_intent, detect_list_documents_intent, detect_section_request
 from app.agent.llm_client import LLMServiceError, chat_completion
 from app.agent.mcp_client import call_tool, open_mcp_session
 from app.core.security import mint_internal_token
@@ -130,6 +130,27 @@ TOOL_DEFINITIONS: dict[str, dict] = {
             },
         },
     },
+    "get_document_section": {
+        "type": "function",
+        "function": {
+            "name": "get_document_section",
+            "description": (
+                "Lit le texte exact d'une page (PDF) ou section (titre/bloc) d'un document "
+                "interne autorisé - identifié par document_id ou par document_name."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string", "description": "Identifiant (UUID) du document"},
+                    "document_name": {"type": "string", "description": "Titre (ou partie du titre) du document"},
+                    "page": {"type": "integer", "description": "Numéro de page (PDF)"},
+                    "section": {"type": "string", "description": "Nom de la section ou du bloc"},
+                    "offset": {"type": "integer", "description": "Caractère de départ (pour lire la suite)", "default": 0},
+                },
+                "required": [],
+            },
+        },
+    },
 }
 
 SYSTEM_PROMPT = """Tu es l'assistant IA interne d'Orbitia. Tu réponds aux employés en te \
@@ -162,9 +183,16 @@ class AgentTurnResult:
     sources: list[dict] = field(default_factory=list)
     tool_trace: list[dict] = field(default_factory=list)
     degraded: bool = False
+    # Structured continuity for the *next* turn's follow-up references
+    # ("la première occurrence", "ce document", "le deuxième", "suite") -
+    # persisted on the assistant Message row (see app/models/chat.py),
+    # never sent to the frontend. None means "nothing to follow up on".
+    reference_context: dict | None = None
 
 
-async def run_agent_turn(*, user_id: str, grant: Grant, message: str, history: list[dict]) -> AgentTurnResult:
+async def run_agent_turn(
+    *, user_id: str, grant: Grant, message: str, history: list[dict], last_reference_context: dict | None = None
+) -> AgentTurnResult:
     tools_schema = [TOOL_DEFINITIONS[name] for name in TOOL_DEFINITIONS if name in grant.tools]
     internal_token = mint_internal_token(
         user_id=user_id, role=grant.role, departments=sorted(grant.departments), max_level=grant.max_level
@@ -187,6 +215,13 @@ async def run_agent_turn(*, user_id: str, grant: Grant, message: str, history: l
                 list_intent = detect_list_documents_intent(message)
                 if list_intent is not None:
                     return await _run_list_documents(session, list_intent, tool_trace)
+
+            if "get_document_section" in grant.tools:
+                section_request = detect_section_request(message)
+                if section_request is not None:
+                    return await _run_get_document_section(
+                        session, section_request, last_reference_context, tool_trace
+                    )
 
             early_result = await _ground_with_search(session, message, tool_trace, sources_by_doc, messages)
             if early_result is not None:
@@ -460,7 +495,28 @@ async def _run_search_keyword(session, keyword: str, whole_word: bool, tool_trac
         }
         for doc in result["documents"]
     ]
-    return AgentTurnResult(answer=_format_keyword_result(result), sources=sources, tool_trace=tool_trace)
+    reference_context = None
+    if result["documents"]:
+        # Lets a follow-up ("ouvre la première occurrence", "ouvre le
+        # deuxième document") jump straight to a location without the user
+        # repeating the document/page - see _resolve_section_request.
+        reference_context = {
+            "kind": "keyword_search",
+            "keyword": keyword,
+            "documents": [
+                {
+                    "document_id": doc["document_id"],
+                    "title": doc["title"],
+                    "locations": [
+                        {"page": loc["page"], "section": loc["section"]} for loc in doc["locations"]
+                    ],
+                }
+                for doc in result["documents"]
+            ],
+        }
+    return AgentTurnResult(
+        answer=_format_keyword_result(result), sources=sources, tool_trace=tool_trace, reference_context=reference_context
+    )
 
 
 def _format_keyword_result(result: dict) -> str:
@@ -533,6 +589,159 @@ def _format_list_documents_result(result: dict) -> str:
         lines.append(
             f"- {doc['title']}{type_label} — {doc['department']} / {doc['confidentiality']}{author_label} — {date_label}"
         )
+    return "\n".join(lines)
+
+
+def _resolve_section_request(
+    request: SectionRequest, ctx: dict | None
+) -> tuple[str | None, str | None, int | None, str | None, int] | AgentTurnResult:
+    """Turns a parsed SectionRequest plus the previous turn's
+    reference_context into either a ready-to-call
+    (document_id, document_name, page, section, offset) tuple, or a
+    terminal AgentTurnResult (a clarification/"nothing to continue"
+    message - no tool call, so no audit entry either, this is pure UX, not
+    a security decision). Always returns one or the other, never None -
+    once detect_section_request has matched at all, the user clearly meant
+    a section-reading request, so a clarification beats silently handing
+    an unreliable small model a reference it's equally unlikely to resolve.
+    """
+    if request.continuation:
+        if not ctx or ctx.get("kind") != "document_section" or not ctx.get("truncated"):
+            return AgentTurnResult(answer="Il n'y a rien à continuer pour le moment.")
+        return (ctx["document_id"], None, ctx.get("page"), ctx.get("section"), ctx["next_offset"])
+
+    if request.first_occurrence:
+        docs = (ctx or {}).get("documents") if (ctx or {}).get("kind") == "keyword_search" else None
+        if not docs or not docs[0].get("locations"):
+            return AgentTurnResult(answer="Je ne sais pas à quelle occurrence vous faites référence - reformulez votre recherche.")
+        loc = docs[0]["locations"][0]
+        return (docs[0]["document_id"], None, loc.get("page"), loc.get("section"), 0)
+
+    if request.nth_choice is not None:
+        n = request.nth_choice
+        kind = (ctx or {}).get("kind")
+        if kind == "document_choice":
+            candidates = ctx.get("candidates") or []
+            if n < 1 or n > len(candidates):
+                return AgentTurnResult(answer=f"Il n'y a pas de {n}e choix dans la liste précédente.")
+            return (candidates[n - 1]["document_id"], None, ctx.get("page"), ctx.get("section"), 0)
+        if kind == "keyword_search":
+            docs = ctx.get("documents") or []
+            if n < 1 or n > len(docs) or not docs[n - 1].get("locations"):
+                return AgentTurnResult(answer=f"Il n'y a pas de {n}e document dans les résultats précédents.")
+            loc = docs[n - 1]["locations"][0]
+            return (docs[n - 1]["document_id"], None, loc.get("page"), loc.get("section"), 0)
+        return AgentTurnResult(answer="Je ne sais pas à quel élément vous faites référence - reformulez.")
+
+    if not request.has_location:
+        return AgentTurnResult(answer="Précisez une page ou une section à afficher.")
+
+    if request.document_name:
+        return (None, request.document_name, request.page, request.section, 0)
+
+    document_id = None
+    if ctx and ctx.get("kind") == "document_section":
+        document_id = ctx.get("document_id")
+    elif ctx and ctx.get("kind") == "keyword_search":
+        docs = ctx.get("documents") or []
+        document_id = docs[0]["document_id"] if docs else None
+
+    if document_id is None:
+        return AgentTurnResult(answer="De quel document parlez-vous ? Précisez son nom.")
+
+    return (document_id, None, request.page, request.section, 0)
+
+
+async def _run_get_document_section(
+    session, request: SectionRequest, last_reference_context: dict | None, tool_trace: list[dict]
+) -> AgentTurnResult:
+    """Voie A, like search_keyword/list_documents: the exact page/section
+    text is shown verbatim, formatted in Python - never paraphrased by the
+    LLM. These are quality/procedure documents; a 1.5B model reformulating
+    a requirement or a value is a correctness risk, and skipping the LLM
+    entirely for the raw text is also one less place a prompt-injection
+    payload embedded in a document could act on."""
+    resolved = _resolve_section_request(request, last_reference_context)
+    if isinstance(resolved, AgentTurnResult):
+        return resolved
+
+    document_id, document_name, page, section, offset = resolved
+    arguments = {
+        "document_id": document_id,
+        "document_name": document_name,
+        "page": page,
+        "section": section,
+        "offset": offset,
+    }
+    result = await call_tool(session, "get_document_section", arguments)
+    decision = "DENY" if "error" in result else "ALLOW"
+    tool_trace.append(
+        {"tool": "get_document_section", "arguments": arguments, "decision": decision, "reason": result.get("error", "ok")}
+    )
+
+    if decision == "DENY":
+        if result.get("service_unavailable"):
+            return AgentTurnResult(
+                answer="Le service de documents est momentanément indisponible. Réessayez dans un instant.",
+                tool_trace=tool_trace,
+                degraded=True,
+            )
+        return AgentTurnResult(answer=f"Accès refusé : {result['error']}", tool_trace=tool_trace, degraded=True)
+
+    if "choices" in result:
+        reference_context = {
+            "kind": "document_choice",
+            "candidates": result["choices"],
+            "page": result.get("page"),
+            "section": result.get("section"),
+        }
+        return AgentTurnResult(
+            answer=_format_document_choices(result["choices"]), tool_trace=tool_trace, reference_context=reference_context
+        )
+
+    reference_context = {
+        "kind": "document_section",
+        "document_id": result["document_id"],
+        "title": result["title"],
+        "page": result["page"],
+        "section": result["section"],
+        "offset": result["offset"],
+        "next_offset": result["offset"] + len(result["text"]),
+        "total_length": result["total_length"],
+        "truncated": result["truncated"],
+    }
+    sources = [
+        {
+            "document_id": result["document_id"],
+            "title": result["title"],
+            "department": result["department"],
+            "confidentiality": result["confidentiality"],
+            "excerpt": result["text"][:280],
+        }
+    ]
+    return AgentTurnResult(
+        answer=_format_document_section_result(result), sources=sources, tool_trace=tool_trace, reference_context=reference_context
+    )
+
+
+def _format_document_choices(choices: list[dict]) -> str:
+    lines = ["Plusieurs documents correspondent à ce nom :", ""]
+    for i, choice in enumerate(choices, start=1):
+        lines.append(f"{i}. {choice['title']}")
+    lines.append("")
+    lines.append("Lequel voulez-vous ouvrir ?")
+    return "\n".join(lines)
+
+
+def _format_document_section_result(result: dict) -> str:
+    where = f"Page {result['page']}" if result.get("page") is not None else f"Section « {result['section']} »"
+    header = f"{result['title']} — {where} — Confidentialité : {result['confidentiality']}"
+    lines = [header, "", result["text"]]
+    if result.get("truncated"):
+        start = result["offset"]
+        end = start + len(result["text"])
+        lines.append("")
+        lines.append(f"[Affichage des caractères {start} à {end} sur {result['total_length']}. Dites « suite » pour continuer.]")
     return "\n".join(lines)
 
 
