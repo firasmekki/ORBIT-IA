@@ -7,6 +7,21 @@ session would test nothing meaningful. Set TEST_DATABASE_URL to point
 elsewhere (e.g. in CI); defaults to the same Postgres container the app
 uses in docker-compose, just a different database name.
 
+Three independent layers now keep this suite from ever touching the real
+demo database again (see INCIDENTS.md for what happened before they
+existed):
+  1. The connection below uses `orbitia_test`, a role with no CONNECT
+     privilege on the `orbitia` database at all - even a DATABASE_URL typo
+     pointing at the wrong database fails at the connection itself
+     ("permission denied for database"), not by successfully connecting
+     and then damaging the wrong data.
+  2. `os.environ["DATABASE_URL"]` is force-overridden (not setdefault),
+     so an ambient DATABASE_URL from the container environment (e.g.
+     docker-compose's &backend-env anchor, which points at the real
+     database for the app itself) can never silently win.
+  3. The startswith("orbitia_test") check below refuses to even start
+     the suite otherwise.
+
 DocumentPage rows are inserted directly rather than through
 app.rag.ingest.ingest_document, since that also embeds DocumentChunk rows
 via Ollama - unnecessary and slow for tests that only exercise
@@ -20,16 +35,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-# Unconditional override, NOT setdefault: when this suite runs via
-# `docker compose run backend ...`, DATABASE_URL is already set in the
-# container's environment (the &backend-env anchor in docker-compose.yml
-# points it at the real demo database) - setdefault would then silently
-# keep that value, and every test's TRUNCATE in the `db` fixture below
-# would wipe the real orbitia database instead of orbitia_test. This
-# happened once already; the check right below is the second line of
-# defense in case this override is ever bypassed some other way.
 os.environ["DATABASE_URL"] = os.environ.get(
-    "TEST_DATABASE_URL", "postgresql+psycopg://orbitia:orbitia@localhost:5432/orbitia_test"
+    "TEST_DATABASE_URL", "postgresql+psycopg://orbitia_test:orbitia_test@localhost:5432/orbitia_test"
 )
 
 from app.core.migrations import bootstrap_schema  # noqa: E402
