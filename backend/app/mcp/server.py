@@ -20,18 +20,22 @@ import uuid
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
-from sqlalchemy import or_
+from sqlalchemy import func, or_, true
 
 from app.core.audit_logger import log_event
 from app.core.database import SessionLocal
 from app.mcp.context import IdentityError, extract_identity
-from app.models.document import Document
+from app.models.document import Document, DocumentPage
 from app.models.finance import FinancialRecord
 from app.models.user import User
 from app.policy.engine import check_document_access, check_tool_access, retrieval_scope
 from app.policy.rules import Grant, resolve_effective_grant
 from app.rag.embeddings import EmbeddingServiceError
+from app.rag.normalize import normalize
 from app.rag.retriever import retrieve_with_out_of_scope_signal
+from app.rag.search_keyword import build_pattern, find_matches, is_arabic_keyword
+
+MAX_LOCATIONS_PER_DOCUMENT = 5
 
 mcp_app = FastMCP(
     name="orbitia-mcp",
@@ -181,6 +185,130 @@ def _get_document_impl(user_id: str, document_id: str) -> dict:
         db.close()
 
 
+def _search_keyword_impl(user_id: str, keyword: str, whole_word: bool) -> dict:
+    db = SessionLocal()
+    try:
+        user, grant = _load_user_and_grant(db, user_id)
+        decision = check_tool_access(grant=grant, tool_name="search_keyword")
+        if not decision.allowed:
+            _audit(db, user=user, role=grant.role if grant else None, action="MCP_SEARCH_KEYWORD", decision="DENY", reason=decision.reason)
+            return {"error": decision.reason}
+
+        pattern = build_pattern(keyword, whole_word)
+        if pattern is None:
+            return {"error": "mot-clé vide ou invalide"}
+
+        departments, max_rank = retrieval_scope(grant=grant)
+        normalized_kw = normalize(keyword)
+        # unaccent() only folds Latin diacritics (é/è/ç/...), not Arabic
+        # alef variants/tashkeel - an Arabic keyword skips this SQL
+        # pre-filter entirely and scans all authorized pages directly in
+        # Python instead, so it can never silently drop a real match.
+        use_sql_prefilter = not is_arabic_keyword(keyword)
+
+        def _prefiltered(query):
+            if use_sql_prefilter and normalized_kw:
+                return query.filter(func.unaccent(func.lower(DocumentPage.text)).ilike(f"%{normalized_kw}%"))
+            return query
+
+        try:
+            documents: dict[str, dict] = {}
+            total_count = 0
+            if departments:
+                in_scope_query = (
+                    db.query(DocumentPage, Document)
+                    .join(Document, Document.id == DocumentPage.document_id)
+                    .filter(Document.department.in_(departments), Document.confidentiality_rank <= max_rank)
+                )
+                for page, doc in _prefiltered(in_scope_query).all():
+                    matches = find_matches(page.text, page.line_offset, pattern)
+                    if not matches:
+                        continue
+                    total_count += len(matches)
+                    entry = documents.setdefault(
+                        str(doc.id),
+                        {
+                            "document_id": str(doc.id),
+                            "title": doc.title,
+                            "department": doc.department,
+                            "confidentiality": doc.confidentiality,
+                            "count": 0,
+                            "locations": [],
+                        },
+                    )
+                    entry["count"] += len(matches)
+                    for match in matches:
+                        if len(entry["locations"]) < MAX_LOCATIONS_PER_DOCUMENT:
+                            entry["locations"].append(
+                                {"page": page.page_no, "section": page.section, "line": match.line, "excerpt": match.excerpt}
+                            )
+
+            # Same silent-filtering-detection pattern as
+            # retrieve_with_out_of_scope_signal: only probed when the
+            # caller's own authorized results came back empty, and only a
+            # metadata signal (department/confidentiality) is ever returned
+            # - never which document, its title, or its content.
+            out_of_scope_hint = None
+            if total_count == 0:
+                out_of_scope_condition = (
+                    or_(~Document.department.in_(departments), Document.confidentiality_rank > max_rank)
+                    if departments
+                    else true()
+                )
+                out_of_scope_query = (
+                    db.query(DocumentPage, Document)
+                    .join(Document, Document.id == DocumentPage.document_id)
+                    .filter(out_of_scope_condition)
+                )
+                for page, doc in _prefiltered(out_of_scope_query).limit(50).all():
+                    if find_matches(page.text, page.line_offset, pattern):
+                        out_of_scope_hint = {"department": doc.department, "confidentiality": doc.confidentiality}
+                        break
+        except Exception as exc:  # noqa: BLE001
+            # A query/code failure here is an infrastructure problem, not a
+            # permission decision - must never be phrased as (or alerted
+            # like) an access refusal. routers/chat.py specifically excludes
+            # any tool_trace reason starting with "service unavailable"
+            # from raising a Director alert (see EmbeddingServiceError
+            # handling in _search_documents_impl for the same convention).
+            _audit(
+                db,
+                user=user,
+                role=grant.role,
+                action="MCP_SEARCH_KEYWORD",
+                decision="DENY",
+                reason=f"service unavailable: {exc}",
+            )
+            return {"error": str(exc), "service_unavailable": True}
+
+        _audit(
+            db,
+            user=user,
+            role=grant.role,
+            action="MCP_SEARCH_KEYWORD",
+            decision="ALLOW",
+            reason="ok",
+            extra={
+                "keyword": keyword,
+                "whole_word": whole_word,
+                "total_count": total_count,
+                "out_of_scope_hint": out_of_scope_hint,
+            },
+        )
+
+        response: dict = {
+            "keyword": keyword,
+            "whole_word": whole_word,
+            "total_count": total_count,
+            "documents": sorted(documents.values(), key=lambda d: d["count"], reverse=True),
+        }
+        if out_of_scope_hint:
+            response["restricted_match"] = out_of_scope_hint
+        return response
+    finally:
+        db.close()
+
+
 _STOPWORDS = {
     "le", "la", "les", "un", "une", "des", "de", "du", "quel", "quelle", "quels", "quelles",
     "est", "sont", "pour", "avec", "dans", "sur", "moi", "donne", "montre", "quelle", "que",
@@ -291,6 +419,20 @@ async def get_document(document_id: str, ctx: Context) -> dict:
     except IdentityError as exc:
         return {"error": str(exc)}
     return await anyio.to_thread.run_sync(_get_document_impl, identity.user_id, document_id)
+
+
+@mcp_app.tool()
+async def search_keyword(keyword: str, ctx: Context, whole_word: bool = True) -> dict:
+    """Count exact occurrences of `keyword` across internal documents the
+    caller is authorized to read (case/accent-insensitive, Arabic alef and
+    tashkeel normalized). Returns a total count and, per document, up to 5
+    locations (page/section, line, short excerpt) - the count itself is
+    always exact even when locations shown are capped."""
+    try:
+        identity = extract_identity(ctx)
+    except IdentityError as exc:
+        return {"error": str(exc)}
+    return await anyio.to_thread.run_sync(_search_keyword_impl, identity.user_id, keyword, whole_word)
 
 
 @mcp_app.tool()

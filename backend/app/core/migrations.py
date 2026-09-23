@@ -15,6 +15,7 @@ from app.core.database import Base
 def bootstrap_schema(conn: Connection) -> None:
     conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+    conn.execute(text("CREATE EXTENSION IF NOT EXISTS unaccent"))
     Base.metadata.create_all(bind=conn)
 
     conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS extra_departments VARCHAR(32)[] NOT NULL DEFAULT '{}'"))
