@@ -28,3 +28,7 @@ Thumbs.db
 # Logs / local scratch
 *.log
 *.tmp
+
+# Local data (never commit real documents or DB dumps)
+/backups/
+/watched-documents/

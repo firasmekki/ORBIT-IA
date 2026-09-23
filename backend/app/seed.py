@@ -13,8 +13,9 @@ Director's full-access path.
 
 import sys
 
-from app.core.database import SessionLocal, engine
-from app.core.migrations import bootstrap_schema
+from app.core.config import get_settings
+from app.core.database import SessionLocal, get_migration_engine
+from app.core.migrations import run_privileged_migration
 from app.core.security import hash_password
 from app.models.document import CONFIDENTIALITY_RANK, Document, DocumentChunk
 from app.models.finance import FinancialRecord
@@ -159,8 +160,7 @@ FINANCIAL_RECORDS = [
 
 
 def ensure_schema() -> None:
-    with engine.begin() as conn:
-        bootstrap_schema(conn)
+    run_privileged_migration(get_migration_engine(), get_settings())
 
 
 def seed_users(db) -> None:

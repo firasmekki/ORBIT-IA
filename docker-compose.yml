@@ -102,7 +102,16 @@ services:
     build: ./backend
     command: ["python", "-m", "app.mcp.server"]
     environment: &backend-env
-      DATABASE_URL: "postgresql+psycopg://orbitia:${POSTGRES_PASSWORD:-orbitia}@postgres:5432/orbitia"
+      # The app's day-to-day connection: `orbitia_app`, a low-privilege
+      # role with no DDL/TRUNCATE rights and only INSERT+SELECT on
+      # audit_logs (see app/core/migrations.py's bootstrap_roles_and_grants
+      # and INCIDENTS.md for why). Schema migrations use a SEPARATE,
+      # privileged connection (MIGRATION_DATABASE_URL, below) - only
+      # main.py's lifespan / seed.py / backfill_pages.py ever touch it.
+      DATABASE_URL: "postgresql+psycopg://orbitia_app:${APP_DB_PASSWORD:-orbitia_app}@postgres:5432/orbitia"
+      MIGRATION_DATABASE_URL: "postgresql+psycopg://orbitia:${POSTGRES_PASSWORD:-orbitia}@postgres:5432/orbitia"
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-orbitia_app}
+      BACKUP_DIR: /backups
       # Dev defaults below are fine on localhost. Before putting this on any
       # server reachable by others, copy .env.example to .env and set real
       # random values - anyone who can read these two secrets can mint
@@ -128,6 +137,13 @@ services:
       # server's real origin once you have one, e.g.
       # CORS_ORIGINS=https://orbitia.example.com in .env
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8081,http://localhost:5173}
+      # Auto-import: only `backend` actually watches (see its `volumes:`
+      # below) - harmless no-op on mcp/seed, kept here just so all three
+      # share one environment block.
+      WATCH_FOLDER_ENABLED: ${WATCH_FOLDER_ENABLED:-false}
+      WATCH_FOLDER_PATH: /data/watch
+      WATCH_FOLDER_DEPARTMENT: ${WATCH_FOLDER_DEPARTMENT:-GENERAL}
+      WATCH_FOLDER_CONFIDENTIALITY: ${WATCH_FOLDER_CONFIDENTIALITY:-INTERNAL}
     depends_on:
       postgres:
         condition: service_healthy
@@ -135,6 +151,14 @@ services:
   backend:
     build: ./backend
     environment: *backend-env
+    # Folder auto-import (see app/rag/watcher.py). Host path defaults to a
+    # project-local folder (created automatically, gitignored) - point
+    # WATCH_FOLDER_HOST_PATH in .env at a real folder and set
+    # WATCH_FOLDER_ENABLED=true to turn it on. Harmless if left disabled:
+    # the mount exists but nothing reads it.
+    volumes:
+      - ${WATCH_FOLDER_HOST_PATH:-./watched-documents}:/data/watch
+      - ./backups:/backups
     depends_on:
       postgres:
         condition: service_healthy
@@ -157,12 +181,30 @@ services:
     build: ./backend
     command: ["python", "-m", "app.seed"]
     environment: *backend-env
+    volumes:
+      - ./backups:/backups
     depends_on:
       postgres:
         condition: service_healthy
       ollama-init:
         condition: service_completed_successfully
     restart: "no"
+
+  # Daily pg_dump, independent of the pre-migration one that
+  # run_privileged_migration triggers on its own (app/core/backup.py).
+  # Runs once at container start and every 24h after - simple sleep-loop
+  # rather than a real cron daemon, same style as app/rag/watcher.py's
+  # polling loop. 7-day rotation happens inside run_backup() itself.
+  backup:
+    build: ./backend
+    command: ["sh", "-c", "while true; do python -m app.core.backup daily; sleep 86400; done"]
+    environment: *backend-env
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
 
   frontend:
     build: ./frontend

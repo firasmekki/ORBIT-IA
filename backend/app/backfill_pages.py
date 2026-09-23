@@ -19,8 +19,9 @@ keyword-searchable, which is the actual goal here.
 
 import sys
 
-from app.core.database import SessionLocal, engine
-from app.core.migrations import bootstrap_schema
+from app.core.config import get_settings
+from app.core.database import SessionLocal, get_migration_engine
+from app.core.migrations import run_privileged_migration
 from app.core.storage import download_file
 from app.models.document import Document, DocumentPage
 from app.rag.extract import ExtractionError, UnsupportedFileTypeError, extract
@@ -28,8 +29,7 @@ from app.rag.ingest import ingest_document
 
 
 def run() -> None:
-    with engine.begin() as conn:
-        bootstrap_schema(conn)
+    run_privileged_migration(get_migration_engine(), get_settings())
 
     db = SessionLocal()
     try:
