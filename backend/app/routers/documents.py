@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.alert_service import create_alert
 from app.core.audit_logger import log_event
+from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.storage import download_file, upload_file
@@ -13,13 +14,23 @@ from app.models.document import CONFIDENTIALITY_RANK, Document
 from app.models.user import User
 from app.policy.engine import check_document_access, retrieval_scope
 from app.policy.rules import resolve_effective_grant
-from app.rag.extract import ExtractionError, UnsupportedFileTypeError, extract_text
+from app.rag.extract import ExtractionError, UnsupportedFileTypeError, extract
 from app.rag.ingest import ingest_document
-from app.schemas.document import DocumentCreate, DocumentDetail, DocumentSummary
+from app.schemas.document import DocumentCreate, DocumentDetail, DocumentSummary, DocumentUpdate
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+@router.get("/watch-status")
+def watch_status(_user: User = Depends(get_current_user)) -> dict:
+    settings = get_settings()
+    return {
+        "enabled": settings.watch_folder_enabled,
+        "department": settings.watch_folder_department,
+        "confidentiality": settings.watch_folder_confidentiality,
+    }
 
 
 @router.get("", response_model=list[DocumentSummary])
@@ -102,6 +113,78 @@ def get_document(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Accès refusé : vous n'avez pas la permission de consulter ce document.",
         )
+    return doc
+
+
+@router.patch("/{document_id}", response_model=DocumentDetail)
+def update_document(
+    document_id: uuid.UUID,
+    payload: DocumentUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Document:
+    """Correct a document's classification (e.g. filed as PUBLIC by mistake).
+    Content/file are untouched - only metadata changes, so no re-ingestion
+    is needed: the RAG retriever joins on Document.department/confidentiality
+    live at query time, it never bakes permissions into the embedding."""
+    doc = db.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document introuvable.")
+
+    grant = resolve_effective_grant(user)
+
+    current_decision = check_document_access(grant=grant, department=doc.department, confidentiality=doc.confidentiality)
+    if not current_decision.allowed:
+        create_alert(
+            alert_type="DOCUMENT_ACCESS_DENIED",
+            user_id=user.id,
+            username=user.username,
+            role=user.role,
+            title=f"Tentative de modification refusée ({user.full_name})",
+            description=f"Document visé : « {doc.title} » ({doc.department} / {doc.confidentiality})\nRefus : {current_decision.reason}",
+            resource_type="document",
+            resource_id=str(doc.id),
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Accès refusé à ce document.")
+
+    new_department = payload.department or doc.department
+    new_confidentiality = payload.confidentiality or doc.confidentiality
+    if new_confidentiality not in CONFIDENTIALITY_RANK:
+        raise HTTPException(status_code=422, detail="Niveau de confidentialité inconnu.")
+
+    # Can only move a document within the same range they could themselves
+    # read - same rule as creating one. Stops a low-privilege account from
+    # using "correct a mistake" to relabel a document into a department or
+    # confidentiality level above its own clearance.
+    target_decision = check_document_access(grant=grant, department=new_department, confidentiality=new_confidentiality)
+    log_event(
+        user_id=user.id,
+        username=user.username,
+        role=user.role,
+        action="UPDATE_DOCUMENT",
+        decision="ALLOW" if target_decision.allowed else "DENY",
+        resource_type="document",
+        resource_id=str(doc.id),
+        reason=target_decision.reason,
+        extra={
+            "title": doc.title,
+            "from": {"department": doc.department, "confidentiality": doc.confidentiality},
+            "to": {"department": new_department, "confidentiality": new_confidentiality},
+        },
+    )
+    if not target_decision.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Vous ne pouvez pas déplacer ce document vers un niveau d'accès supérieur au vôtre.",
+        )
+
+    if payload.title is not None:
+        doc.title = payload.title
+    doc.department = new_department
+    doc.confidentiality = new_confidentiality
+    doc.confidentiality_rank = CONFIDENTIALITY_RANK[new_confidentiality]
+    db.commit()
+    db.refresh(doc)
     return doc
 
 
@@ -206,7 +289,7 @@ async def upload_document(
         raise HTTPException(status_code=422, detail="Le fichier est vide.")
 
     try:
-        text = extract_text(file.filename or "", raw)
+        extraction = extract(file.filename or "", raw)
     except UnsupportedFileTypeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except ExtractionError as exc:
@@ -223,7 +306,7 @@ async def upload_document(
         department=department,
         confidentiality=confidentiality,
         confidentiality_rank=CONFIDENTIALITY_RANK[confidentiality],
-        content=text,
+        content=extraction.text,
         source_filename=file.filename,
         minio_object_key=object_key,
         owner_id=user.id,
@@ -232,5 +315,5 @@ async def upload_document(
     db.commit()
     db.refresh(doc)
 
-    ingest_document(db, doc)
+    ingest_document(db, doc, pages=extraction.pages)
     return doc
