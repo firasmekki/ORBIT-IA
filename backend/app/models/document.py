@@ -55,8 +55,19 @@ class DocumentChunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dim), nullable=False)
+    # Which DocumentPage this chunk's text starts within, in the same
+    # flattened-text character space app.rag.extract's _assemble() and
+    # app.rag.ingest's chunk_text() both work in - NULL when the position
+    # couldn't be exactly verified (see chunk_text's self-check) or for
+    # chunks ingested before this column existed. Never a guess: a chunk
+    # is only linked once its exact character span is confirmed to
+    # reproduce its own text and to fall inside a single page's range.
+    document_page_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("document_pages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     document: Mapped["Document"] = relationship(back_populates="chunks")
+    document_page: Mapped["DocumentPage | None"] = relationship()
 
 
 class DocumentPage(Base):

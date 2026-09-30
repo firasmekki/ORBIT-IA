@@ -33,6 +33,24 @@ def bootstrap_schema(conn: Connection) -> None:
 
     conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)"))
 
+    # search_documents page/section enrichment. Nullable and backfilled
+    # lazily (only on the next re-ingestion of each document, no forced
+    # re-embed of everything that already exists) - a chunk with no known
+    # page yet just reports page/section as null, never a guess.
+    conn.execute(text("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS document_page_id UUID"))
+    conn.execute(
+        text(
+            "DO $$ BEGIN "
+            "IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints "
+            "WHERE constraint_name = 'document_chunks_document_page_id_fkey') THEN "
+            "ALTER TABLE document_chunks ADD CONSTRAINT document_chunks_document_page_id_fkey "
+            "FOREIGN KEY (document_page_id) REFERENCES document_pages(id) ON DELETE SET NULL; "
+            "END IF; "
+            "END $$;"
+        )
+    )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_document_chunks_document_page_id ON document_chunks (document_page_id)"))
+
     conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS extra_departments VARCHAR(32)[] NOT NULL DEFAULT '{}'"))
     conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS confidentiality_override VARCHAR(32)"))
     conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS extra_tools VARCHAR(64)[] NOT NULL DEFAULT '{}'"))
