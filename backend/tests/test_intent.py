@@ -66,3 +66,32 @@ def test_no_trigger_returns_none():
 
 def test_trigger_but_empty_keyword_returns_none():
     assert detect_keyword_intent('cherche le mot ""') is None
+
+
+def test_natural_phrasing_reported_bug():
+    # Real user phrasing that used to fall through to the LLM entirely:
+    # "chercher" (infinitive, not "cherche"), lots of words between the
+    # verb and "mot", and a two-word unquoted name.
+    result = detect_keyword_intent(
+        "chercher ds les documents il ya un documnts contient le mot firas mekki "
+        "dis moi lla paragraphe avec la page et le nom du documnts"
+    )
+    assert result is not None
+    assert result.keyword == "firas mekki"
+
+
+def test_contient_le_mot_trigger():
+    result = detect_keyword_intent("il y a un document qui contient le mot budget dans le rapport")
+    assert result is not None
+    assert result.keyword == "budget"
+
+
+def test_chercher_infinitive_form():
+    result = detect_keyword_intent("peux-tu chercher le mot congés")
+    assert result is not None
+    assert result.keyword == "congés"
+
+
+def test_two_word_name_unquoted_still_trimmed_at_trailing_clause():
+    result = detect_keyword_intent("cherche le mot firas mekki dans les documents")
+    assert result.keyword == "firas mekki"

@@ -22,18 +22,48 @@ from dataclasses import dataclass
 from app.rag.normalize import normalize
 
 _QUOTED = re.compile(r"[\"'«»](.+?)[\"'»]")
-# Single token only for unquoted extraction - deliberately not multi-word:
-# with no closing delimiter to bound it, a greedy multi-word capture eats
-# trailing words it was never meant to ("où apparaît firas dans les
-# documents" -> "firas dans les documents" instead of "firas"). Multi-word
-# keywords still work fine, just quote them - the quoted path above
-# extracts them exactly, with no ambiguity about where they end.
 _WORD = r"[^\s\"'.,;:!?»«]+"
+# Up to 3 tokens (covers "firas mekki" - a first+last name is the most
+# common real multi-word case), NOT unbounded: an open-ended capture is
+# what caused the original over-capture bug ("où apparaît firas dans les
+# documents" -> "firas dans les documents"). The remaining risk of eating a
+# trailing clause is handled by _trim_at_stopword below, not by the regex
+# itself - most of these extractors are naturally bounded by a required
+# trailing anchor (" apparaît", " mawjoud", ...) where backtracking already
+# resolves to the minimal capture; only the open-ended ones ("cherche le
+# mot X", "contient le mot X" - nothing has to follow X) actually need the
+# stopword trim to stay safe.
+_PHRASE = rf"({_WORD}(?:\s+{_WORD}){{0,2}})"
 _STRIP_CHARS = " \t\n\r.,;:!?»«\"'"
 
+_TRAILING_STOPWORDS = {
+    "dans", "de", "du", "des", "sur", "pour", "avec", "sans", "et", "ou",
+    "qui", "que", "ce", "cette", "ces", "il", "elle", "la", "le", "les",
+    "dis", "dis-moi", "montre", "montre-moi", "donne", "donne-moi",
+    "affiche", "affiche-moi", "stp", "svp",
+}
+
+
+def _trim_at_stopword(phrase: str) -> str:
+    """Cuts a multi-word capture at the first word that looks like the
+    start of a trailing clause rather than part of the keyword itself -
+    e.g. "firas mekki dis" -> "firas mekki", "firas dans" -> "firas"."""
+    kept: list[str] = []
+    for word in phrase.split():
+        if word.strip(_STRIP_CHARS).lower() in _TRAILING_STOPWORDS:
+            break
+        kept.append(word)
+    return " ".join(kept)
+
+
 _TRIGGERS = [
-    # FR: cherche/recherche/trouve le mot/terme/nom ...
-    re.compile(r"(?:cherche|recherche|trouve)\s+(?:le\s+)?(?:mot|terme|nom)\b", re.IGNORECASE),
+    # FR: cherche/recherche/trouve/chercher ... mot/terme/nom - `.*` between
+    # the verb and the noun on purpose: real phrasing rarely has them
+    # adjacent ("chercher dans les documents ... contient le mot X").
+    re.compile(r"\b(?:cherche|recherche|trouve|cherch(?:er|ez))\b.*\b(?:mot|terme|nom)\b", re.IGNORECASE),
+    # FR: "il y a un document qui contient le mot/terme X" - contains/
+    # containing, independent of the cherche/trouve verbs above.
+    re.compile(r"\bcontient\b.*\b(?:mot|terme)\b", re.IGNORECASE),
     # FR: combien de fois ...
     re.compile(r"combien\s+de\s+fois\b", re.IGNORECASE),
     # FR: où apparaît / se trouve ...
@@ -48,12 +78,19 @@ _TRIGGERS = [
 # Only used when nothing is quoted - best-effort, ordered most-specific
 # first. Each must capture exactly the keyword in group(1).
 _EXTRACTORS = [
-    re.compile(rf"(?:cherche|recherche|trouve)\s+(?:le\s+)?(?:mot|terme|nom)\s+(?:est\s+)?[\"']?({_WORD})[\"']?", re.IGNORECASE),
+    re.compile(rf"(?:cherche|recherche|trouve|cherch(?:er|ez))\b.*?\b(?:le\s+)?(?:mot|terme|nom)\s+(?:est\s+)?[\"']?{_PHRASE}[\"']?", re.IGNORECASE),
+    re.compile(rf"\bcontient\b.*?\b(?:le\s+)?(?:mot|terme)\s+[\"']?{_PHRASE}[\"']?", re.IGNORECASE),
     re.compile(
-        rf"combien\s+de\s+fois\s+(?:le\s+mot\s+|le\s+terme\s+)?[\"']?({_WORD})[\"']?\s+(?:apparaît|apparait|revient|figure)",
+        rf"combien\s+de\s+fois\s+(?:le\s+mot\s+|le\s+terme\s+)?[\"']?{_PHRASE}[\"']?\s+(?:apparaît|apparait|revient|figure)",
         re.IGNORECASE,
     ),
-    re.compile(rf"où\s+(?:est-ce\s+que\s+)?(?:apparaît|apparait|se trouve)\s+[\"']?({_WORD})[\"']?", re.IGNORECASE),
+    re.compile(rf"où\s+(?:est-ce\s+que\s+)?(?:apparaît|apparait|se trouve)\s+[\"']?{_PHRASE}[\"']?", re.IGNORECASE),
+    # Single-word only below (_WORD, not _PHRASE): these aren't anchored on
+    # the left the way the ones above are (nothing has to precede the
+    # capture group), so a multi-word cap would greedily swallow whatever
+    # trigger word came before it too (e.g. "qadech marra firas mawjouda"
+    # -> "qadech marra firas" instead of "firas") - caught by
+    # tests/test_intent.py::test_derja_word_before_mawjouda.
     re.compile(rf"({_WORD})\s+mawjoud", re.IGNORECASE),
     re.compile(rf"mawjoud[a-z]*\s+({_WORD})", re.IGNORECASE),
     re.compile(rf"win\s+mawjouda\s+({_WORD})", re.IGNORECASE),
@@ -79,7 +116,7 @@ def detect_keyword_intent(message: str) -> KeywordIntent | None:
     for extractor in _EXTRACTORS:
         match = extractor.search(message)
         if match:
-            keyword = match.group(1).strip(_STRIP_CHARS)
+            keyword = _trim_at_stopword(match.group(1).strip(_STRIP_CHARS))
             if keyword:
                 return KeywordIntent(keyword=keyword)
     return None
