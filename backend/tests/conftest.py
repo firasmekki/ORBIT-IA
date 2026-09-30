@@ -39,10 +39,24 @@ os.environ["DATABASE_URL"] = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+psycopg://orbitia_test:orbitia_test@localhost:5432/orbitia_test"
 )
 
+from app.core.config import get_settings  # noqa: E402
 from app.core.migrations import bootstrap_schema  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
-from app.models.document import CONFIDENTIALITY_RANK, Document, DocumentPage  # noqa: E402
+from app.models.document import CONFIDENTIALITY_RANK, Document, DocumentChunk, DocumentPage  # noqa: E402
 from app.models.user import User  # noqa: E402
+
+EMBEDDING_DIM = get_settings().embedding_dim
+
+
+def hot_vector(index: int, magnitude: float = 1.0) -> list[float]:
+    """A one-hot-ish embedding vector for deterministic cosine-distance
+    tests (search_documents' score/ordering) - no Ollama call needed, and
+    the similarity between any two hot_vector() results is exactly
+    controllable: identical index -> cosine distance 0 (score 1.0),
+    different index -> orthogonal (distance 1, score 0.0)."""
+    v = [0.0] * EMBEDDING_DIM
+    v[index % EMBEDDING_DIM] = magnitude
+    return v
 
 TEST_DATABASE_URL = os.environ["DATABASE_URL"]
 
@@ -128,6 +142,20 @@ def make_user(db, *, username, role, extra_departments=None, confidentiality_ove
     return user
 
 
+def make_chunk(db, *, document_id, chunk_text, embedding, document_page_id=None, chunk_index=0):
+    chunk = DocumentChunk(
+        document_id=document_id,
+        chunk_index=chunk_index,
+        chunk_text=chunk_text,
+        embedding=embedding,
+        document_page_id=document_page_id,
+    )
+    db.add(chunk)
+    db.commit()
+    db.refresh(chunk)
+    return chunk
+
+
 @pytest.fixture
 def make_doc(db):
     return lambda **kwargs: make_document(db, **kwargs)
@@ -136,3 +164,15 @@ def make_doc(db):
 @pytest.fixture
 def make_test_user(db):
     return lambda **kwargs: make_user(db, **kwargs)
+
+
+@pytest.fixture
+def make_test_chunk(db):
+    return lambda **kwargs: make_chunk(db, **kwargs)
+
+
+@pytest.fixture
+def pages_of(db):
+    """Returns a document's DocumentPage rows in creation order - lets a
+    test link a hand-made chunk to a specific page by index."""
+    return lambda document_id: db.query(DocumentPage).filter(DocumentPage.document_id == document_id).order_by(DocumentPage.order_index).all()

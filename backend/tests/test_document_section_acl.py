@@ -25,6 +25,45 @@ def test_authorized_read_by_page(make_doc, make_test_user):
     assert result["title"] == "Procédure qualité"
 
 
+def test_no_location_given_opens_first_page(make_doc, make_test_user):
+    """Real gap found in live testing: a reference_context-driven follow-up
+    ("ouvre le deuxième résultat") whose source location was page=None/
+    section=None (a legacy chunk not yet re-linked to a page) used to hit
+    "précisez une page ou une section" - confusing, since the caller never
+    asked for a specific page. Omitting both now opens the document from
+    its first page/section instead."""
+    doc = make_doc(
+        title="Doc",
+        department="GENERAL",
+        confidentiality="INTERNAL",
+        pages=[(1, None, 1, "Contenu de la page 1"), (2, None, 1, "Contenu de la page 2")],
+    )
+    employee = make_test_user(username="emp_sec_nodoc", role="EMPLOYEE")
+
+    result = mcp_server._get_document_section_impl(str(employee.id), str(doc.id), None, None, None, 0)
+
+    assert "error" not in result
+    assert result["page"] == 1
+    assert result["text"] == "Contenu de la page 1"
+
+
+def test_no_location_given_on_manually_created_document(make_doc, make_test_user):
+    """The synthetic single-page fallback (page_no=None, section=None) must
+    still resolve, not crash on a None passed into section normalization."""
+    doc = make_doc(
+        title="Doc manuel",
+        department="GENERAL",
+        confidentiality="INTERNAL",
+        pages=[(None, None, 1, "Texte tapé à la main.")],
+    )
+    employee = make_test_user(username="emp_sec_nodoc2", role="EMPLOYEE")
+
+    result = mcp_server._get_document_section_impl(str(employee.id), str(doc.id), None, None, None, 0)
+
+    assert "error" not in result
+    assert result["text"] == "Texte tapé à la main."
+
+
 def test_authorized_read_by_section(make_doc, make_test_user):
     doc = make_doc(
         title="Manuel",

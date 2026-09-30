@@ -1,6 +1,26 @@
 from app.agent.intent import detect_section_request
 
 
+def test_ordinal_result_anchored_wins_over_bogus_section_capture():
+    # Real reported gap: "correspondante" must never be captured as a
+    # section name here - "du premier résultat" has to resolve to
+    # nth_choice=1 (via first_occurrence, since "premier résultat" is
+    # recognized the same as "première occurrence").
+    r = detect_section_request("Ouvre la section correspondante du premier résultat.")
+    assert r.first_occurrence is True
+    assert r.section is None
+
+
+def test_ordinal_result_second_anchored():
+    r = detect_section_request("Ouvre le deuxième résultat.")
+    assert r.nth_choice == 2
+
+
+def test_ordinal_result_with_du_article():
+    r = detect_section_request("ouvre le document correspondant au troisième résultat")
+    assert r.nth_choice == 3
+
+
 def test_page_with_document_name():
     r = detect_section_request("ouvre la page 2 de Charte de l'entreprise")
     assert r.page == 2
