@@ -21,7 +21,7 @@ non-answer, and (b) let the caller raise a Director-facing alert.
 from sqlalchemy import or_, true
 from sqlalchemy.orm import Session
 
-from app.models.document import Document, DocumentChunk
+from app.models.document import Document, DocumentChunk, DocumentPage
 from app.policy.engine import retrieval_scope
 from app.policy.rules import Grant
 from app.rag.embeddings import embed_text
@@ -38,8 +38,9 @@ def retrieve_with_out_of_scope_signal(
     best_in_scope_distance: float | None = None
     if departments:
         rows = (
-            db.query(DocumentChunk, Document, distance_expr.label("distance"))
+            db.query(DocumentChunk, Document, distance_expr.label("distance"), DocumentPage)
             .join(Document, Document.id == DocumentChunk.document_id)
+            .outerjoin(DocumentPage, DocumentPage.id == DocumentChunk.document_page_id)
             .filter(Document.department.in_(departments), Document.confidentiality_rank <= max_rank)
             .order_by(distance_expr)
             .limit(top_k)
@@ -52,8 +53,15 @@ def retrieve_with_out_of_scope_signal(
                 "department": doc.department,
                 "confidentiality": doc.confidentiality,
                 "chunk_text": chunk.chunk_text,
+                # pgvector's cosine_distance is exactly 1 - cosine_similarity
+                # for the `<=>` operator, so this is the real similarity, not
+                # an approximation - 1.0 = identical direction, 0.0 =
+                # orthogonal, negative = opposite. Higher is more relevant.
+                "score": round(1 - float(distance), 3),
+                "page": page.page_no if page is not None else None,
+                "section": page.section if page is not None else None,
             }
-            for chunk, doc, _distance in rows
+            for chunk, doc, distance, page in rows
         ]
         if rows:
             best_in_scope_distance = float(rows[0][2])

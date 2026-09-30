@@ -130,6 +130,16 @@ def _search_documents_impl(user_id: str, query: str, top_k: int) -> dict:
                     "department": r["department"],
                     "confidentiality": r["confidentiality"],
                     "excerpt": r["chunk_text"][:600],
+                    # Relevance score: 1.0 = identical direction, 0.0 =
+                    # unrelated, negative = opposite - higher is more
+                    # relevant. Results are already ordered by it.
+                    "score": r["score"],
+                    # Only set when this chunk's page/section could be
+                    # exactly determined (see app/rag/ingest.py) - never a
+                    # guess, null when unknown (e.g. a document indexed
+                    # before this linkage existed, pending re-ingestion).
+                    "page": r["page"],
+                    "section": r["section"],
                 }
                 for r in results
             ]
@@ -446,8 +456,6 @@ def _get_document_section_impl(
 
         if not document_id and not document_name:
             return {"error": "précisez document_id ou document_name"}
-        if page is None and not section:
-            return {"error": "précisez une page ou une section"}
 
         departments, max_rank = retrieval_scope(grant=grant)
 
@@ -520,7 +528,18 @@ def _get_document_section_impl(
             return {"error": DOCUMENT_NOT_FOUND_OR_DENIED}
 
         page_query = db.query(DocumentPage).filter(DocumentPage.document_id == doc.id)
-        if page is not None:
+        if page is None and not section:
+            # No location given at all (e.g. a reference_context-driven
+            # follow-up whose source result had no known page/section yet -
+            # a legacy chunk pending re-ingestion) - open the document from
+            # its first page/section rather than demanding a location the
+            # caller has no way to know. An explicit page/section request
+            # that genuinely doesn't exist still errors normally below.
+            match = page_query.order_by(DocumentPage.order_index).first()
+            if match is None:
+                return {"error": f"« {doc.title} » n'a aucun contenu indexé"}
+            page, section = match.page_no, match.section
+        elif page is not None:
             match = page_query.filter(DocumentPage.page_no == page).first()
         else:
             normalized_section = normalize(section)
@@ -728,9 +747,10 @@ async def get_document_section(
     a summary. Identify the document with either `document_id` or
     `document_name` (exact-then-partial title match among authorized
     documents; ambiguous names return `choices` to pick from instead of
-    text). Long sections are capped at 2000 characters - pass the returned
-    `offset` back to continue reading. A nonexistent document and an
-    unauthorized one return the identical error, by design."""
+    text). Omit both `page` and `section` to open the document from its
+    first page/section. Long sections are capped at 2000 characters - pass
+    the returned `offset` back to continue reading. A nonexistent document
+    and an unauthorized one return the identical error, by design."""
     try:
         identity = extract_identity(ctx)
     except IdentityError as exc:
