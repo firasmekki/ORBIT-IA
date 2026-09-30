@@ -220,15 +220,25 @@ _ORDINAL_WORDS = {
     "quatrième": 4, "quatrieme": 4, "4e": 4, "4eme": 4, "4ème": 4,
     "cinquième": 5, "cinquieme": 5, "5e": 5, "5eme": 5, "5ème": 5,
 }
-_NTH_CHOICE_RE = re.compile(
-    r"\b(?:le|la)\s+(" + "|".join(sorted(_ORDINAL_WORDS, key=len, reverse=True)) + r")\b", re.IGNORECASE
+_ORDINAL_ALT = "|".join(sorted(_ORDINAL_WORDS, key=len, reverse=True))
+_ARTICLES = r"le|la|du|des|au|un|une"
+_NTH_CHOICE_RE = re.compile(rf"\b(?:{_ARTICLES})\s+({_ORDINAL_ALT})\b", re.IGNORECASE)
+# High-confidence version: the ordinal is directly followed by a noun that
+# unambiguously means "one of the previous list" (résultat/occurrence/
+# document/choix) - checked BEFORE section-name extraction gets a chance to
+# run, so "la section correspondante du premier résultat" resolves via this
+# (nth_choice=1) instead of _SECTION_NAME_RE wrongly capturing
+# "correspondante" as if it were a real section name.
+_ANCHORED_NTH_RE = re.compile(
+    rf"\b(?:{_ARTICLES})\s+({_ORDINAL_ALT})\s+(?:occurrence|résultat|resultat|document|choix)\b",
+    re.IGNORECASE,
 )
 
 _SECTION_TRIGGER = re.compile(
-    r"\b(?:ouvre|ouvrir|montre(?:-moi)?|affiche(?:-moi)?)\b.*\b(?:page|section|bloc|paragraphe|occurrence)\b"
-    r"|\bpremi[eè]re?\s+occurrence\b"
+    r"\b(?:ouvre|ouvrir|montre(?:-moi)?|affiche(?:-moi)?)\b.*\b(?:page|section|bloc|paragraphe|occurrence|résultat|resultat)\b"
+    r"|\bpremi(?:er|ère)\s+(?:occurrence|résultat|resultat)\b"
     r"|^\s*(?:suite|continue|continuer)\s*[.!]?\s*$"
-    r"|\b(?:le|la)\s+(?:" + "|".join(sorted(_ORDINAL_WORDS, key=len, reverse=True)) + r")\b",
+    r"|\b(?:" + _ARTICLES + r")\s+(?:" + _ORDINAL_ALT + r")\b",
     re.IGNORECASE,
 )
 
@@ -252,7 +262,7 @@ _CONTEXT_DOC_RE = re.compile(r"\bde\s+ce\s+document\b|\bce\s+document\b|\bcette\
 # character class itself.
 _DOCUMENT_NAME_RE = re.compile(r"\bde\s+(?!ce\s+document\b|cette\s+page\b|ce\s+doc\b)[\"']?(.+?)[\"']?\s*[.!?]?\s*$", re.IGNORECASE)
 
-_FIRST_OCCURRENCE_RE = re.compile(r"\bpremi[eè]re?\s+occurrence\b", re.IGNORECASE)
+_FIRST_OCCURRENCE_RE = re.compile(r"\bpremi(?:er|ère)\s+(?:occurrence|résultat|resultat)\b", re.IGNORECASE)
 _CONTINUATION_RE = re.compile(r"^\s*(?:suite|continue|continuer)\s*[.!]?\s*$", re.IGNORECASE)
 
 
@@ -280,6 +290,10 @@ def detect_section_request(message: str) -> SectionRequest | None:
 
     if _FIRST_OCCURRENCE_RE.search(message):
         return SectionRequest(first_occurrence=True)
+
+    anchored_nth = _ANCHORED_NTH_RE.search(message)
+    if anchored_nth:
+        return SectionRequest(nth_choice=_ORDINAL_WORDS[anchored_nth.group(1).lower()])
 
     nth_match = _NTH_CHOICE_RE.search(message)
     # Only treat "le deuxième" etc. as a choice-list reference when there's

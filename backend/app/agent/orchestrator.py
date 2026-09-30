@@ -201,6 +201,10 @@ async def run_agent_turn(
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": message}]
     tool_trace: list[dict] = []
     sources_by_doc: dict[str, dict] = {}
+    # Single-slot mutable out-param, same pattern as sources_by_doc/
+    # tool_trace above - _ground_with_search sets ["value"] when its
+    # results can seed a follow-up ("ouvre le deuxième résultat").
+    reference_context_holder: dict = {}
 
     try:
         async with open_mcp_session(internal_token) as session:
@@ -223,7 +227,9 @@ async def run_agent_turn(
                         session, section_request, last_reference_context, tool_trace
                     )
 
-            early_result = await _ground_with_search(session, message, tool_trace, sources_by_doc, messages)
+            early_result = await _ground_with_search(
+                session, message, tool_trace, sources_by_doc, messages, reference_context_holder
+            )
             if early_result is not None:
                 return early_result
 
@@ -239,7 +245,10 @@ async def run_agent_turn(
                 if not tool_calls:
                     answer = assistant_message.get("content") or "Je n'ai pas de réponse à formuler."
                     return AgentTurnResult(
-                        answer=answer, sources=list(sources_by_doc.values()), tool_trace=tool_trace
+                        answer=answer,
+                        sources=list(sources_by_doc.values()),
+                        tool_trace=tool_trace,
+                        reference_context=reference_context_holder.get("value"),
                     )
 
                 messages.append(assistant_message)
@@ -292,7 +301,12 @@ async def run_agent_turn(
 
 
 async def _ground_with_search(
-    session, message: str, tool_trace: list[dict], sources_by_doc: dict[str, dict], messages: list[dict]
+    session,
+    message: str,
+    tool_trace: list[dict],
+    sources_by_doc: dict[str, dict],
+    messages: list[dict],
+    reference_context_out: dict,
 ) -> AgentTurnResult | None:
     """Always run one permission-filtered search before handing off to the
     model, and inject the (already-authorized) excerpts as context.
@@ -355,8 +369,30 @@ async def _ground_with_search(
         )
 
     if items:
+        # Same reference_context shape _run_search_keyword builds ("kind":
+        # "keyword_search", documents -> locations) - deliberately reused
+        # as-is, not a parallel format, so _resolve_section_request's
+        # existing first_occurrence/nth_choice handling picks these up
+        # unchanged ("ouvre le deuxième résultat" / "ouvre cette section"
+        # after a semantic search work exactly like they do after
+        # search_keyword). One entry per ranked result (not deduplicated by
+        # document) so "second result" means the second list item, matching
+        # what the user was just shown.
+        reference_context_out["value"] = {
+            "kind": "keyword_search",
+            "keyword": message,
+            "documents": [
+                {
+                    "document_id": it["document_id"],
+                    "title": it["title"],
+                    "locations": [{"page": it.get("page"), "section": it.get("section")}],
+                }
+                for it in items
+            ],
+        }
         excerpt_block = "\n\n".join(
-            f"- [{it['title']} | {it['department']} | {it['confidentiality']}] {it['excerpt']}" for it in items
+            f"- [{it['title']} | {it['department']} | {it['confidentiality']} | score {it.get('score')}] {it['excerpt']}"
+            for it in items
         )
         messages.append(
             {
