@@ -30,6 +30,13 @@ class Document(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     source_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     minio_object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # sha256 of the raw uploaded/watched file bytes, set by app/rag/watcher.py
+    # (NULL for hand-typed/manually-uploaded documents) - lets the watcher
+    # tell "this filename was already imported" apart from "this filename
+    # was already imported AND hasn't changed since", so editing a file
+    # already sitting in the watched folder gets picked up on the next scan
+    # instead of being silently ignored forever.
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

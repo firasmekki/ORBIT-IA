@@ -13,6 +13,7 @@ Desktop on Windows/macOS can have with native filesystem events) - a few
 seconds of latency for a background import is an acceptable trade-off.
 """
 
+import hashlib
 import logging
 import time
 import uuid
@@ -66,7 +67,7 @@ def _maybe_ingest(db: Session, path: Path) -> None:
     # store a relative path (e.g. "test/report.xlsx") while the watcher only
     # ever sees the bare filename - an exact-string compare would miss that
     # collision and re-import (and re-embed) the same file a second time.
-    already = (
+    existing = (
         db.query(Document)
         .filter(
             Document.source_filename.ilike(f"%{path.name}"),
@@ -74,8 +75,6 @@ def _maybe_ingest(db: Session, path: Path) -> None:
         )
         .first()
     )
-    if already is not None:
-        return
 
     # Skip a file that's still being copied/written: size must be stable
     # across two checks a second apart before we touch it.
@@ -94,6 +93,10 @@ def _maybe_ingest(db: Session, path: Path) -> None:
         logger.warning("Could not read %s, will retry next scan: %s", path.name, exc)
         return
 
+    content_hash = hashlib.sha256(raw).hexdigest()
+    if existing is not None and existing.content_hash == content_hash:
+        return  # already imported, file unchanged since - nothing to do
+
     try:
         extraction = extract(path.name, raw)
     except (UnsupportedFileTypeError, ExtractionError) as exc:
@@ -108,23 +111,39 @@ def _maybe_ingest(db: Session, path: Path) -> None:
         logger.warning("MinIO unavailable, will retry %s next scan: %s", path.name, exc)
         return
 
-    doc = Document(
-        title=path.stem,
-        department=settings.watch_folder_department,
-        confidentiality=confidentiality,
-        confidentiality_rank=CONFIDENTIALITY_RANK[confidentiality],
-        content=extraction.text,
-        source_filename=path.name,
-        minio_object_key=object_key,
-        owner_id=None,
-    )
-    db.add(doc)
-    db.commit()
-    db.refresh(doc)
+    if existing is not None:
+        # Same filename, different (or never-hashed, i.e. imported before
+        # content_hash existed) content - re-index in place rather than
+        # creating a duplicate: same document_id, fresh content/pages/
+        # chunks/embeddings, new MinIO object (the old one is left orphaned
+        # rather than deleted, consistent with how re-uploads elsewhere in
+        # the app never delete prior file bytes either).
+        doc = existing
+        doc.content = extraction.text
+        doc.content_hash = content_hash
+        doc.minio_object_key = object_key
+        db.commit()
+        action, verb = "re-indexed changed file", "Re-indexed"
+    else:
+        doc = Document(
+            title=path.stem,
+            department=settings.watch_folder_department,
+            confidentiality=confidentiality,
+            confidentiality_rank=CONFIDENTIALITY_RANK[confidentiality],
+            content=extraction.text,
+            content_hash=content_hash,
+            source_filename=path.name,
+            minio_object_key=object_key,
+            owner_id=None,
+        )
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+        action, verb = "auto-imported", "Auto-imported"
 
     try:
         ingest_document(db, doc, pages=extraction.pages)
     except Exception:  # noqa: BLE001 - document exists even if embedding failed; ingest_document is re-run-safe
-        logger.exception("Embedding failed for auto-imported %s (document created, will not retry)", path.name)
+        logger.exception("Embedding failed for %s %s (document saved, will not retry)", action, path.name)
     else:
-        logger.info("Auto-imported %s -> document %s", path.name, doc.id)
+        logger.info("%s %s -> document %s", verb, path.name, doc.id)
