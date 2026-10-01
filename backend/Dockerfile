@@ -23,6 +23,13 @@ RUN apt-get update \
     && apt-get purge -y --auto-remove gnupg curl \
     && rm -rf /var/lib/apt/lists/*
 
+# OCR for scanned PDFs and images (app/rag/extract.py's _ocr_image /
+# _extract_pdf_blocks fallback) - French pack alongside the default
+# English since Orbitia's demo content is French.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-fra \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

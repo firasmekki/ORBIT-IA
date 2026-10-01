@@ -12,7 +12,15 @@ separate structure from the overlapping RAG chunks.
 
 Splitting strategy per format:
 - PDF: one page per physical page (`page_no` set, never further split -
-  page number is already a meaningful, real anchor).
+  page number is already a meaningful, real anchor). A page with no text
+  layer (scanned/image page) falls back to OCR for that page only - a
+  mixed PDF (some real text pages, some scanned) is handled correctly
+  page-by-page, never OCR'd wholesale just because one page needs it.
+- PPTX: one page per slide (`page_no` set, same anchor rationale as PDF) -
+  text frames, table cells, then OCR text from any picture shape on that
+  slide, in that order.
+- Images (JPG/PNG): a single block, OCR'd - there is no sub-structure to
+  anchor a page/section to.
 - XLSX: one section per sheet (`section` = sheet name).
 - DOCX/MD: one section per heading (Heading 1/2/3 in DOCX, #/##/### in MD),
   named after the heading text. Falls back to fixed-size line blocks if the
@@ -20,15 +28,20 @@ Splitting strategy per format:
 - TXT/MD-without-headings/DOCX-without-headings: fixed ~50-line blocks
   ("Bloc 1", "Bloc 2", ...).
 - Any section/page longer than ~150 lines (XLSX sheets, DOCX/MD sections)
-  is further split into "<name> (partie N)" parts - a PDF page is exempt,
-  it stays a single unit no matter its length.
+  is further split into "<name> (partie N)" parts - a PDF/PPTX page is
+  exempt, it stays a single unit no matter its length.
+
+OCR (pytesseract + the system tesseract-ocr/tesseract-ocr-fra packages,
+see the Dockerfile) is best-effort: a page/image OCR fails silently into
+"no text found" rather than raising, so one unreadable scan never breaks
+extraction of the rest of a document.
 """
 
 import re
 from dataclasses import dataclass
 from io import BytesIO
 
-SUPPORTED_EXTENSIONS = {"txt", "md", "pdf", "xlsx", "docx"}
+SUPPORTED_EXTENSIONS = {"txt", "md", "pdf", "xlsx", "docx", "pptx", "jpg", "jpeg", "png"}
 
 BLOCK_SIZE = 50
 MAX_SECTION_LINES = 150
@@ -81,6 +94,10 @@ def extract(filename: str, content: bytes) -> ExtractionResult:
             blocks = _extract_xlsx_blocks(content)
         elif ext == "docx":
             blocks = _extract_docx_blocks(content)
+        elif ext == "pptx":
+            blocks = _extract_pptx_blocks(content)
+        elif ext in ("jpg", "jpeg", "png"):
+            blocks = _extract_image_blocks(content)
         else:  # pragma: no cover - unreachable given the set check above
             raise UnsupportedFileTypeError(ext)
     except UnsupportedFileTypeError:
@@ -157,6 +174,31 @@ def _heading_sections_to_blocks(sections: list[tuple[str | None, list[str]]]) ->
     return blocks
 
 
+def _ocr_image_bytes(image_bytes: bytes) -> str:
+    """Best-effort OCR - never raises: a page/shape that can't be OCR'd
+    (corrupt image, tesseract missing at runtime, unsupported format)
+    contributes empty text rather than failing the whole document."""
+    try:
+        from PIL import Image
+        import pytesseract
+
+        image = Image.open(BytesIO(image_bytes))
+        return pytesseract.image_to_string(image, lang="fra+eng").strip()
+    except Exception:  # noqa: BLE001 - OCR is a best-effort enhancement, not a hard requirement
+        return ""
+
+
+def _ocr_pdf_page(content: bytes, page_index: int) -> str:
+    import fitz  # pymupdf
+
+    pdf = fitz.open(stream=content, filetype="pdf")
+    try:
+        pixmap = pdf[page_index].get_pixmap(dpi=200)
+        return _ocr_image_bytes(pixmap.tobytes("png"))
+    finally:
+        pdf.close()
+
+
 def _extract_pdf_blocks(content: bytes) -> list[tuple[int, None, str]]:
     from pypdf import PdfReader
 
@@ -164,10 +206,15 @@ def _extract_pdf_blocks(content: bytes) -> list[tuple[int, None, str]]:
     blocks: list[tuple[int, None, str]] = []
     for i, page in enumerate(reader.pages):
         text = (page.extract_text() or "").strip()
+        if not text:
+            # No text layer on this page specifically (scanned/image page) -
+            # OCR just this page, never the whole document, so a mixed
+            # PDF (some real text, some scans) keeps its real text exact.
+            text = _ocr_pdf_page(content, i)
         if text:
             blocks.append((i + 1, None, text))
     if not blocks:
-        raise ExtractionError("aucun texte extractible (PDF scanné/image sans OCR ?)")
+        raise ExtractionError("aucun texte extractible, même après OCR (PDF vide ou pages illisibles)")
     return blocks
 
 
@@ -237,3 +284,40 @@ def _extract_markdown_blocks(raw_text: str) -> list[tuple[None, str | None, str]
     if not found_heading:
         return None
     return _heading_sections_to_blocks(sections)
+
+
+def _extract_pptx_blocks(content: bytes) -> list[tuple[int, None, str]]:
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    presentation = Presentation(BytesIO(content))
+    blocks: list[tuple[int, None, str]] = []
+    for i, slide in enumerate(presentation.slides):
+        lines: list[str] = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                text = shape.text_frame.text.strip()
+                if text:
+                    lines.append(text)
+            if shape.has_table:
+                for row in shape.table.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                    if cells:
+                        lines.append(" | ".join(cells))
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                ocr_text = _ocr_image_bytes(shape.image.blob)
+                if ocr_text:
+                    lines.append(ocr_text)
+        text = "\n".join(lines).strip()
+        if text:
+            blocks.append((i + 1, None, text))
+    if not blocks:
+        raise ExtractionError("aucun texte extractible dans cette présentation")
+    return blocks
+
+
+def _extract_image_blocks(content: bytes) -> list[tuple[None, None, str]]:
+    text = _ocr_image_bytes(content)
+    if not text:
+        raise ExtractionError("aucun texte détecté par OCR dans cette image")
+    return [(None, None, text)]
