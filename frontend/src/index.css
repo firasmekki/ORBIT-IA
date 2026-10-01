@@ -1269,20 +1269,21 @@ table.data-table {
 }
 
 .chart-block {
-  /* Self-contained chart chrome: in light mode these fall back to the
-     app's existing tokens (zero visual change), but the chart card also
-     carries its own dark-mode values below - so it reads correctly in a
-     dark OS/browser even before the rest of the app has a dark theme. */
-  --chart-surface: var(--surface);
-  --chart-surface-alt: var(--surface-alt);
-  --chart-ink: var(--text);
-  --chart-ink-muted: var(--text-muted);
-  --chart-border: var(--border);
-  --chart-grid: var(--border);
+  /* Fixed light theme, intentionally not dark-mode-aware - matches the
+     rest of the app (no dark theme exists outside this component either)
+     and avoids a chart card that looks spliced against an otherwise-light
+     page. All chart chrome is still driven through these custom
+     properties rather than hardcoded in ChartBlock.tsx, so the whole
+     theme stays swappable from this one place. */
+  --chart-surface: #ffffff;
+  --chart-surface-alt: #f3f4f6;
+  --chart-ink: #111827;
+  --chart-ink-muted: #374151;
+  --chart-border: #e5e7eb;
+  --chart-grid: #e5e7eb;
   /* Categorical series palette - fixed order (never cycled/reassigned per
      filter), validated for CVD-safe adjacent contrast with
-     dataviz skill's validate_palette.js (worst adjacent ΔE 12.8 light,
-     9.7 dark - always paired with the legend below, never color-alone). */
+     dataviz skill's validate_palette.js (worst adjacent ΔE 12.8). */
   --chart-series-1: #2f6fed;
   --chart-series-2: #e8a13d;
   --chart-series-3: #2f7d4e;
@@ -1295,23 +1296,6 @@ table.data-table {
   border-radius: var(--radius-lg);
   border: 1px solid var(--chart-border);
   background: var(--chart-surface);
-}
-
-@media (prefers-color-scheme: dark) {
-  .chart-block {
-    --chart-surface: #1a1a19;
-    --chart-surface-alt: #22221f;
-    --chart-ink: #ffffff;
-    --chart-ink-muted: #c3c2b7;
-    --chart-border: #2c2c2a;
-    --chart-grid: #2c2c2a;
-    --chart-series-1: #3987e5;
-    --chart-series-2: #c98500;
-    --chart-series-3: #199e70;
-    --chart-series-4: #e66767;
-    --chart-series-5: #9085e9;
-    --chart-series-6: #d95926;
-  }
 }
 
 .chart-title {
@@ -1360,12 +1344,6 @@ table.data-table {
   padding: 10px 13px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
   min-width: 140px;
-}
-
-@media (prefers-color-scheme: dark) {
-  .chart-tooltip {
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
-  }
 }
 
 .chart-tooltip-header {

@@ -187,7 +187,7 @@ function renderChart(
             // reference below, which makes the browser fall back to SVG's
             // default fill (opaque black) instead of the gradient.
             <linearGradient key={vf.field} id={`chart-gradient-${i}`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={SERIES_VARS[i % SERIES_VARS.length]} stopOpacity={0.22} />
+              <stop offset="0%" stopColor={SERIES_VARS[i % SERIES_VARS.length]} stopOpacity={0.14} />
               <stop offset="100%" stopColor={SERIES_VARS[i % SERIES_VARS.length]} stopOpacity={0} />
             </linearGradient>
           ))}
