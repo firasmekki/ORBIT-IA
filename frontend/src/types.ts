@@ -84,6 +84,12 @@ export interface ConversationDetail extends ConversationSummary {
   messages: MessageOut[]
 }
 
+export interface DeleteHistoryResult {
+  deleted_conversation_count: number
+  deleted_message_count: number
+  audit_log_id: string | null
+}
+
 export interface AuditLogOut {
   id: string
   user_id: string | null
@@ -135,7 +141,11 @@ export interface AdminStats {
   users_by_role: Record<string, number>
 }
 
-export type AlertType = 'CHAT_ACCESS_DENIED' | 'DOCUMENT_ACCESS_DENIED'
+export type AlertType =
+  | 'CHAT_ACCESS_DENIED'
+  | 'DOCUMENT_ACCESS_DENIED'
+  | 'HISTORY_CONVERSATION_DELETED'
+  | 'HISTORY_ALL_DELETED'
 
 export interface AlertOut {
   id: string
@@ -150,6 +160,7 @@ export interface AlertOut {
   is_read: boolean
   read_at: string | null
   created_at: string
+  audit_log_id: string | null
 }
 
 export interface AlertPage {

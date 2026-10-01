@@ -1,22 +1,49 @@
 import { useEffect, useState, type ComponentType } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { adminListAlerts, adminMarkAlertRead, adminMarkAllAlertsRead } from '../api/endpoints'
 import { RoleBadge } from '../components/Badges'
-import { IconChat, IconDocument } from '../components/Icons'
+import { IconChat, IconDocument, IconTrash } from '../components/Icons'
 import type { AlertOut, AlertType } from '../types'
 
 const TYPE_LABELS: Record<AlertType, string> = {
   CHAT_ACCESS_DENIED: 'Assistant IA — accès refusé',
   DOCUMENT_ACCESS_DENIED: 'Document — accès refusé',
+  HISTORY_CONVERSATION_DELETED: 'Conversation supprimée',
+  HISTORY_ALL_DELETED: 'Historique supprimé',
 }
 
 const TYPE_ICONS: Record<AlertType, ComponentType<{ size?: number }>> = {
   CHAT_ACCESS_DENIED: IconChat,
   DOCUMENT_ACCESS_DENIED: IconDocument,
+  HISTORY_CONVERSATION_DELETED: IconTrash,
+  HISTORY_ALL_DELETED: IconTrash,
 }
+
+// CHAT_ACCESS_DENIED/DOCUMENT_ACCESS_DENIED are genuine policy refusals
+// (deny-red, by design); the two HISTORY_* types are informational/
+// traceability events, not security denials, so they get the neutral
+// "system" tone instead of red - a Director shouldn't read every entry in
+// this list as an intrusion attempt.
+const TYPE_ICON_TONE: Record<AlertType, string> = {
+  CHAT_ACCESS_DENIED: 'chat',
+  DOCUMENT_ACCESS_DENIED: 'doc',
+  HISTORY_CONVERSATION_DELETED: '',
+  HISTORY_ALL_DELETED: '',
+}
+
+const TYPE_BADGE_CLASS: Record<AlertType, string> = {
+  CHAT_ACCESS_DENIED: 'badge-deny',
+  DOCUMENT_ACCESS_DENIED: 'badge-deny',
+  HISTORY_CONVERSATION_DELETED: 'badge-system',
+  HISTORY_ALL_DELETED: 'badge-system',
+}
+
+const HISTORY_ALERT_TYPES = new Set<AlertType>(['HISTORY_CONVERSATION_DELETED', 'HISTORY_ALL_DELETED'])
 
 const PAGE_SIZE = 30
 
 export function AlertsPage() {
+  const navigate = useNavigate()
   const [items, setItems] = useState<AlertOut[]>([])
   const [total, setTotal] = useState(0)
   const [unreadCount, setUnreadCount] = useState(0)
@@ -89,20 +116,35 @@ export function AlertsPage() {
       <div className="alert-list">
         {items.map((alert) => {
           const Icon = TYPE_ICONS[alert.alert_type] ?? IconDocument
+          const tone = TYPE_ICON_TONE[alert.alert_type] ?? 'doc'
+          const badgeClass = TYPE_BADGE_CLASS[alert.alert_type] ?? 'badge-deny'
           return (
             <div key={alert.id} className={`alert-item${alert.is_read ? '' : ' unread'}`} onClick={() => markRead(alert)}>
-              <div className={`alert-item-icon ${alert.alert_type === 'CHAT_ACCESS_DENIED' ? 'chat' : 'doc'}`}>
+              <div className={`alert-item-icon${tone ? ` ${tone}` : ''}`}>
                 <Icon size={16} />
               </div>
               <div style={{ minWidth: 0, flex: 1 }}>
                 <div className="alert-item-top">
-                  <span className="badge badge-deny">{TYPE_LABELS[alert.alert_type] ?? alert.alert_type}</span>
+                  <span className={`badge ${badgeClass}`}>{TYPE_LABELS[alert.alert_type] ?? alert.alert_type}</span>
                   {alert.role && <RoleBadge role={alert.role} />}
                   {!alert.is_read && <span className="unread-dot" />}
                 </div>
                 <div className="alert-item-title">{alert.title}</div>
                 <div className="alert-item-desc">{alert.description}</div>
                 <div className="alert-item-time">{new Date(alert.created_at).toLocaleString('fr-FR')}</div>
+                {HISTORY_ALERT_TYPES.has(alert.alert_type) && alert.audit_log_id && (
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ marginTop: 8, padding: '4px 10px', fontSize: 11.5 }}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      navigate('/audit')
+                    }}
+                  >
+                    Voir la traçabilité
+                  </button>
+                )}
               </div>
             </div>
           )

@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
-import { getConversation, listConversations, sendChatMessage } from '../api/endpoints'
+import { deleteConversation, deleteHistory, getConversation, listConversations, sendChatMessage } from '../api/endpoints'
 import { ApiError } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 import { ConfidentialityBadge, DecisionBadge } from '../components/Badges'
 import { ChartBlock } from '../components/ChartBlock'
+import { IconTrash } from '../components/Icons'
 import { toolLabel } from '../lib/tools'
 import type { ConversationSummary, MessageOut } from '../types'
 
@@ -27,6 +28,9 @@ export function ChatPage() {
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [successMessage, setSuccessMessage] = useState<string | null>(null)
+  const [showDeleteModal, setShowDeleteModal] = useState(false)
+  const [conversationToDelete, setConversationToDelete] = useState<ConversationSummary | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -36,6 +40,12 @@ export function ChatPage() {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [messages, sending])
+
+  useEffect(() => {
+    if (!successMessage) return
+    const timer = setTimeout(() => setSuccessMessage(null), 4000)
+    return () => clearTimeout(timer)
+  }, [successMessage])
 
   async function refreshConversations() {
     try {
@@ -61,6 +71,26 @@ export function ChatPage() {
     setActiveId(null)
     setMessages([])
     setError(null)
+  }
+
+  function handleHistoryDeleted() {
+    setConversations([])
+    setActiveId(null)
+    setMessages([])
+    setError(null)
+    setShowDeleteModal(false)
+    setSuccessMessage('Historique supprimé avec succès.')
+  }
+
+  function handleConversationDeleted(id: string) {
+    setConversations((prev) => prev.filter((c) => c.id !== id))
+    if (activeId === id) {
+      setActiveId(null)
+      setMessages([])
+    }
+    setError(null)
+    setConversationToDelete(null)
+    setSuccessMessage('Conversation supprimée avec succès.')
   }
 
   async function send(text: string) {
@@ -133,10 +163,33 @@ export function ChatPage() {
                 className={`chat-history-item${c.id === activeId ? ' active' : ''}`}
                 onClick={() => selectConversation(c.id)}
               >
-                {c.title}
+                <span className="chat-history-item-title">{c.title}</span>
+                <button
+                  type="button"
+                  className="chat-history-item-delete"
+                  title="Supprimer cette conversation"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setConversationToDelete(c)
+                  }}
+                >
+                  <IconTrash size={13} />
+                </button>
               </div>
             ))}
           </div>
+          {conversations.length > 0 && (
+            <div className="chat-history-footer">
+              <button
+                className="btn btn-icon-text"
+                style={{ width: '100%', justifyContent: 'center', padding: '7px 10px', fontSize: 12, color: 'var(--deny)' }}
+                onClick={() => setShowDeleteModal(true)}
+              >
+                <IconTrash size={14} />
+                Supprimer l'historique
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="card chat-panel">
@@ -218,6 +271,11 @@ export function ChatPage() {
               {error}
             </div>
           )}
+          {successMessage && (
+            <div className="success-banner" style={{ margin: '0 16px' }}>
+              ✓ {successMessage}
+            </div>
+          )}
 
           <div className="chat-composer">
             <textarea
@@ -230,6 +288,151 @@ export function ChatPage() {
             />
             <button className="btn btn-primary" onClick={() => send(input)} disabled={sending || !input.trim()}>
               Envoyer
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {showDeleteModal && (
+        <DeleteHistoryModal
+          conversationCount={conversations.length}
+          onClose={() => setShowDeleteModal(false)}
+          onDeleted={handleHistoryDeleted}
+        />
+      )}
+
+      {conversationToDelete && (
+        <DeleteConversationModal
+          conversation={conversationToDelete}
+          onClose={() => setConversationToDelete(null)}
+          onDeleted={handleConversationDeleted}
+        />
+      )}
+    </div>
+  )
+}
+
+function DeleteHistoryModal({
+  conversationCount,
+  onClose,
+  onDeleted,
+}: {
+  conversationCount: number
+  onClose: () => void
+  onDeleted: () => void
+}) {
+  const [deleting, setDeleting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function handleConfirm() {
+    setDeleting(true)
+    setError(null)
+    try {
+      await deleteHistory()
+      onDeleted()
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Impossible de supprimer votre historique, réessayez.')
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={deleting ? undefined : onClose}>
+      <div className="modal-card" style={{ maxWidth: 440 }} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>⚠️ Supprimer tout l'historique ?</h3>
+          {!deleting && (
+            <button className="modal-close" onClick={onClose}>
+              ✕
+            </button>
+          )}
+        </div>
+        <div className="modal-body" style={{ whiteSpace: 'normal' }}>
+          {error && <div className="error-banner">{error}</div>}
+          <p style={{ fontSize: 13.5, color: 'var(--text)' }}>
+            Vous êtes sur le point de supprimer {conversationCount} conversation{conversationCount > 1 ? 's' : ''} de
+            votre espace. Une trace de sécurité sera conservée pour assurer la traçabilité.
+          </p>
+          <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20 }}>
+            <button type="button" className="btn" onClick={onClose} disabled={deleting}>
+              Annuler
+            </button>
+            <button
+              type="button"
+              className="btn"
+              style={{ background: 'var(--deny)', borderColor: 'var(--deny)', color: '#fff' }}
+              onClick={handleConfirm}
+              disabled={deleting}
+            >
+              {deleting
+                ? 'Suppression…'
+                : `Supprimer les ${conversationCount} conversation${conversationCount > 1 ? 's' : ''}`}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function DeleteConversationModal({
+  conversation,
+  onClose,
+  onDeleted,
+}: {
+  conversation: ConversationSummary
+  onClose: () => void
+  onDeleted: (id: string) => void
+}) {
+  const [deleting, setDeleting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function handleConfirm() {
+    setDeleting(true)
+    setError(null)
+    try {
+      await deleteConversation(conversation.id)
+      onDeleted(conversation.id)
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Impossible de supprimer cette conversation, réessayez.')
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={deleting ? undefined : onClose}>
+      <div className="modal-card" style={{ maxWidth: 440 }} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>Supprimer cette conversation ?</h3>
+          {!deleting && (
+            <button className="modal-close" onClick={onClose}>
+              ✕
+            </button>
+          )}
+        </div>
+        <div className="modal-body" style={{ whiteSpace: 'normal' }}>
+          {error && <div className="error-banner">{error}</div>}
+          <p style={{ fontSize: 13.5, color: 'var(--text)' }}>
+            Cette conversation sera supprimée de votre historique. Une trace de sécurité sera conservée pour
+            assurer la traçabilité.
+          </p>
+          <p style={{ fontSize: 12.5, color: 'var(--text-muted)', marginTop: 10 }}>
+            « <strong>{conversation.title}</strong> »
+          </p>
+          <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 20 }}>
+            <button type="button" className="btn" onClick={onClose} disabled={deleting}>
+              Annuler
+            </button>
+            <button
+              type="button"
+              className="btn"
+              style={{ background: 'var(--deny)', borderColor: 'var(--deny)', color: '#fff' }}
+              onClick={handleConfirm}
+              disabled={deleting}
+            >
+              {deleting ? 'Suppression…' : 'Supprimer'}
             </button>
           </div>
         </div>

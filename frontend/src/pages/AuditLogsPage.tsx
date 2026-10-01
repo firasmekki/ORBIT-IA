@@ -1,9 +1,13 @@
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { listAuditLogs } from '../api/endpoints'
 import { DecisionBadge, RoleBadge } from '../components/Badges'
 import type { AuditLogOut } from '../types'
 
 const PAGE_SIZE = 40
+
+function formatMetadataKey(key: string): string {
+  return key.replace(/_/g, ' ')
+}
 
 export function AuditLogsPage() {
   const [items, setItems] = useState<AuditLogOut[]>([])
@@ -11,6 +15,7 @@ export function AuditLogsPage() {
   const [decision, setDecision] = useState<'' | 'ALLOW' | 'DENY'>('')
   const [offset, setOffset] = useState(0)
   const [loading, setLoading] = useState(true)
+  const [expandedId, setExpandedId] = useState<string | null>(null)
 
   useEffect(() => {
     setOffset(0)
@@ -68,28 +73,62 @@ export function AuditLogsPage() {
                 <th>Ressource</th>
                 <th>Décision</th>
                 <th>Motif</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
-              {items.map((log) => (
-                <tr key={log.id}>
-                  <td className="mono" style={{ whiteSpace: 'nowrap', fontSize: 12 }}>
-                    {new Date(log.created_at).toLocaleString('fr-FR')}
-                  </td>
-                  <td>{log.username ?? '—'}</td>
-                  <td>{log.role ? <RoleBadge role={log.role} /> : '—'}</td>
-                  <td className="mono" style={{ fontSize: 12 }}>
-                    {log.action}
-                  </td>
-                  <td className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
-                    {log.resource_type ? `${log.resource_type}${log.resource_id ? `#${log.resource_id.slice(0, 8)}` : ''}` : '—'}
-                  </td>
-                  <td>
-                    <DecisionBadge decision={log.decision} />
-                  </td>
-                  <td style={{ fontSize: 12.5, color: 'var(--text-muted)', maxWidth: 280 }}>{log.reason ?? '—'}</td>
-                </tr>
-              ))}
+              {items.map((log) => {
+                const hasDetail = Boolean(log.extra && Object.keys(log.extra).length > 0)
+                const expanded = expandedId === log.id
+                return (
+                  <Fragment key={log.id}>
+                    <tr
+                      style={hasDetail ? { cursor: 'pointer' } : undefined}
+                      onClick={() => hasDetail && setExpandedId(expanded ? null : log.id)}
+                    >
+                      <td className="mono" style={{ whiteSpace: 'nowrap', fontSize: 12 }}>
+                        {new Date(log.created_at).toLocaleString('fr-FR')}
+                      </td>
+                      <td>{log.username ?? '—'}</td>
+                      <td>{log.role ? <RoleBadge role={log.role} /> : '—'}</td>
+                      <td className="mono" style={{ fontSize: 12 }}>
+                        {log.action}
+                      </td>
+                      <td className="mono" style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>
+                        {log.resource_type ? `${log.resource_type}${log.resource_id ? `#${log.resource_id.slice(0, 8)}` : ''}` : '—'}
+                      </td>
+                      <td>
+                        <DecisionBadge decision={log.decision} />
+                      </td>
+                      <td style={{ fontSize: 12.5, color: 'var(--text-muted)', maxWidth: 280 }}>{log.reason ?? '—'}</td>
+                      <td style={{ fontSize: 11.5, color: 'var(--accent-strong)', whiteSpace: 'nowrap' }}>
+                        {hasDetail ? (expanded ? 'Masquer ▲' : 'Détails ▼') : ''}
+                      </td>
+                    </tr>
+                    {expanded && (
+                      <tr>
+                        <td colSpan={8} style={{ background: 'var(--surface-alt)', padding: '10px 14px' }}>
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 24px', fontSize: 12 }}>
+                            <div>
+                              <strong style={{ color: 'var(--text-muted)' }}>Audit ID : </strong>
+                              <span className="mono">{log.id}</span>
+                            </div>
+                            {log.extra &&
+                              Object.entries(log.extra).map(([key, value]) => (
+                                <div key={key}>
+                                  <strong style={{ color: 'var(--text-muted)' }}>{formatMetadataKey(key)} : </strong>
+                                  <span className="mono">
+                                    {typeof value === 'object' ? JSON.stringify(value) : String(value)}
+                                  </span>
+                                </div>
+                              ))}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                )
+              })}
             </tbody>
           </table>
         </div>

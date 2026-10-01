@@ -188,6 +188,17 @@ export function IconMenu(props: IconProps) {
   )
 }
 
+export function IconTrash(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M5 7h14" />
+      <path d="M9.5 7V5a1.5 1.5 0 0 1 1.5-1.5h2A1.5 1.5 0 0 1 14.5 5v2" />
+      <path d="M7 7l.9 12.1A1.5 1.5 0 0 0 9.4 20.5h5.2a1.5 1.5 0 0 0 1.5-1.4L17 7" />
+      <path d="M10.3 11v6M13.7 11v6" />
+    </svg>
+  )
+}
+
 export function IconBuilding(props: IconProps) {
   return (
     <svg {...base(props)}>

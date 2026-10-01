@@ -5,6 +5,7 @@ import type {
   AuditLogPage,
   ConversationDetail,
   ConversationSummary,
+  DeleteHistoryResult,
   DocumentDetail,
   DocumentSummary,
   Me,
@@ -79,6 +80,14 @@ export function listConversations() {
 
 export function getConversation(id: string) {
   return api.get<ConversationDetail>(`/conversations/${id}`)
+}
+
+export function deleteHistory() {
+  return api.delete<DeleteHistoryResult>('/history')
+}
+
+export function deleteConversation(id: string) {
+  return api.delete<DeleteHistoryResult>(`/history/${id}`)
 }
 
 export function listAuditLogs(params: { decision?: 'ALLOW' | 'DENY'; limit?: number; offset?: number } = {}) {

@@ -623,6 +623,21 @@ label.field-label {
   margin-top: 14px;
 }
 
+.success-banner {
+  background: var(--allow-bg);
+  color: var(--allow);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+
+.btn-icon-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 /* ---------- dashboard ---------- */
 
 .stat-grid {
@@ -1088,6 +1103,16 @@ table.data-table {
   justify-content: space-between;
 }
 
+.chat-history-footer {
+  padding: 10px 12px;
+  border-top: 1px solid var(--border);
+}
+
+.chat-history-footer .btn:hover {
+  background: var(--deny-bg);
+  border-color: var(--deny);
+}
+
 .chat-history-list {
   overflow-y: auto;
   padding: 8px;
@@ -1095,12 +1120,20 @@ table.data-table {
 }
 
 .chat-history-item {
-  padding: 9px 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 6px 9px 10px;
   border-radius: var(--radius-sm);
   font-size: 13px;
   cursor: pointer;
   color: var(--text);
   margin-bottom: 2px;
+}
+
+.chat-history-item-title {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1114,6 +1147,29 @@ table.data-table {
   background: var(--accent-soft);
   color: var(--accent-strong);
   font-weight: 600;
+}
+
+.chat-history-item-delete {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.chat-history-item:hover .chat-history-item-delete {
+  display: flex;
+}
+
+.chat-history-item-delete:hover {
+  background: var(--deny-bg);
+  color: var(--deny);
 }
 
 .chat-panel {
