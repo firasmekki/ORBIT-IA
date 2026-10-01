@@ -1178,6 +1178,71 @@ table.data-table {
   overflow: hidden;
 }
 
+.chat-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.workspace-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  color: var(--text);
+  font-size: 12.5px;
+  font-family: inherit;
+  cursor: pointer;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.workspace-button:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.workspace-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--allow);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.workspace-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.workspace-dot.active {
+  background: var(--allow);
+}
+
+.workspace-current {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-alt);
+  font-size: 12.5px;
+  color: var(--text);
+}
+
 .chat-messages {
   flex: 1;
   overflow-y: auto;

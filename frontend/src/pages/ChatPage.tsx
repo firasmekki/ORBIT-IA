@@ -1,12 +1,28 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
-import { deleteConversation, deleteHistory, getConversation, listConversations, sendChatMessage } from '../api/endpoints'
+import {
+  deleteConversation,
+  deleteHistory,
+  getConversation,
+  listConversations,
+  resumeChatMessage,
+  sendChatMessage,
+} from '../api/endpoints'
 import { ApiError } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 import { ConfidentialityBadge, DecisionBadge } from '../components/Badges'
 import { ChartBlock } from '../components/ChartBlock'
 import { IconTrash } from '../components/Icons'
+import { WorkspacePicker } from '../components/WorkspacePicker'
+import {
+  clearWorkspaceHandle,
+  ensureReadPermission,
+  loadWorkspaceHandle,
+  readWorkspaceFile,
+  saveWorkspaceHandle,
+  walkWorkspace,
+} from '../lib/localFs'
 import { toolLabel } from '../lib/tools'
-import type { ConversationSummary, MessageOut } from '../types'
+import type { ConversationSummary, LocalFileEntry, MessageOut, PendingClientAction } from '../types'
 
 const SUGGESTIONS: Record<string, string[]> = {
   DIRECTOR: ['Quel est le budget de la masse salariale 2025 ?', 'Résume le plan stratégique 2026.'],
@@ -31,10 +47,33 @@ export function ChatPage() {
   const [successMessage, setSuccessMessage] = useState<string | null>(null)
   const [showDeleteModal, setShowDeleteModal] = useState(false)
   const [conversationToDelete, setConversationToDelete] = useState<ConversationSummary | null>(null)
+  const [workspaceHandle, setWorkspaceHandle] = useState<FileSystemDirectoryHandle | null>(null)
+  const [workspaceIndex, setWorkspaceIndex] = useState<LocalFileEntry[]>([])
+  const [showWorkspacePicker, setShowWorkspacePicker] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     refreshConversations()
+  }, [])
+
+  useEffect(() => {
+    // Restores the previously granted workspace, if any, on page reload -
+    // the browser may still silently honor the permission (same-origin,
+    // same session) or may require the user to re-confirm; either way we
+    // never re-prompt automatically without a user gesture.
+    ;(async () => {
+      try {
+        const handle = await loadWorkspaceHandle()
+        if (!handle) return
+        const granted = await ensureReadPermission(handle)
+        if (!granted) return
+        setWorkspaceHandle(handle)
+        const entries = await walkWorkspace(handle)
+        setWorkspaceIndex(entries)
+      } catch {
+        // non-fatal - the user can just pick the workspace again
+      }
+    })()
   }, [])
 
   useEffect(() => {
@@ -93,6 +132,85 @@ export function ChatPage() {
     setSuccessMessage('Conversation supprimée avec succès.')
   }
 
+  async function handleWorkspacePicked(handle: FileSystemDirectoryHandle) {
+    setWorkspaceHandle(handle)
+    setShowWorkspacePicker(false)
+
+    // Persisting the handle (so the workspace survives a page reload) is
+    // a separate concern from building this session's index - and must
+    // never block it. IndexedDB can legitimately fail (storage quota,
+    // private browsing restrictions) without that meaning the workspace
+    // itself is unusable right now.
+    try {
+      await saveWorkspaceHandle(handle)
+    } catch {
+      // non-fatal: usable for this session, just won't auto-restore later
+    }
+
+    try {
+      const entries = await walkWorkspace(handle)
+      setWorkspaceIndex(entries)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Impossible de parcourir ce dossier.")
+    }
+  }
+
+  async function handleWorkspaceDisconnect() {
+    setWorkspaceHandle(null)
+    setWorkspaceIndex([])
+    setShowWorkspacePicker(false)
+    try {
+      await clearWorkspaceHandle()
+    } catch {
+      // non-fatal
+    }
+  }
+
+  /** Executes a pending_client_action the backend returned (it has no
+   * disk access - only this tab, holding the real handle, can actually
+   * read the file) and resumes the chat turn with the result. */
+  async function resolvePendingAction(conversationId: string, action: PendingClientAction) {
+    if (!workspaceHandle) {
+      setError("Le workspace n'est plus connecté.")
+      setSending(false)
+      return
+    }
+    try {
+      const { base64 } = await readWorkspaceFile(workspaceHandle, action.relative_path)
+      const response = await resumeChatMessage({
+        conversation_id: conversationId,
+        action_id: action.action_id,
+        relative_path: action.relative_path,
+        name: action.name,
+        content_base64: base64,
+      })
+      if (response.message) {
+        setMessages((prev) => [...prev, response.message as MessageOut])
+      }
+    } catch (err) {
+      const message =
+        err instanceof ApiError
+          ? err.message
+          : err instanceof Error
+            ? `Impossible de lire « ${action.name} » : ${err.message}`
+            : `Impossible de lire « ${action.name} ».`
+      setError(message)
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `error-${Date.now()}`,
+          role: 'assistant',
+          content: `Erreur : ${message}`,
+          sources: [],
+          tool_trace: [],
+          created_at: new Date().toISOString(),
+        },
+      ])
+    } finally {
+      setSending(false)
+    }
+  }
+
   async function send(text: string) {
     const trimmed = text.trim()
     if (!trimmed || sending) return
@@ -111,9 +229,18 @@ export function ChatPage() {
     setSending(true)
 
     try {
-      const response = await sendChatMessage(trimmed, activeId ?? undefined)
+      const response = await sendChatMessage(trimmed, activeId ?? undefined, workspaceIndex.length > 0 ? workspaceIndex : undefined)
       setActiveId(response.conversation_id)
-      setMessages((prev) => [...prev, response.message])
+      if (response.pending_client_action) {
+        // Still "sending" - the backend asked for a local file's content,
+        // which only this tab can actually read (see resolvePendingAction).
+        await resolvePendingAction(response.conversation_id, response.pending_client_action)
+        refreshConversations()
+        return
+      }
+      if (response.message) {
+        setMessages((prev) => [...prev, response.message as MessageOut])
+      }
       refreshConversations()
     } catch (err) {
       const message = err instanceof ApiError ? err.message : 'Une erreur est survenue, réessayez.'
@@ -193,6 +320,19 @@ export function ChatPage() {
         </div>
 
         <div className="card chat-panel">
+          <div className="chat-panel-header">
+            <button type="button" className="workspace-button" onClick={() => setShowWorkspacePicker(true)}>
+              📁 Workspace : {workspaceHandle ? workspaceHandle.name : 'Aucun dossier'}
+              {workspaceHandle && (
+                <span className="workspace-status">
+                  <span className="workspace-dot active" /> Actif
+                </span>
+              )}
+            </button>
+            <button type="button" className="btn" style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => setShowWorkspacePicker(true)}>
+              {workspaceHandle ? 'Changer' : 'Choisir un dossier'}
+            </button>
+          </div>
           <div className="chat-messages" ref={scrollRef}>
             {messages.length === 0 && (
               <div className="chat-empty">
@@ -306,6 +446,15 @@ export function ChatPage() {
           conversation={conversationToDelete}
           onClose={() => setConversationToDelete(null)}
           onDeleted={handleConversationDeleted}
+        />
+      )}
+
+      {showWorkspacePicker && (
+        <WorkspacePicker
+          currentWorkspaceName={workspaceHandle?.name ?? null}
+          onClose={() => setShowWorkspacePicker(false)}
+          onPicked={handleWorkspacePicked}
+          onDisconnect={handleWorkspaceDisconnect}
         />
       )}
     </div>

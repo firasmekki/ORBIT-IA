@@ -3,13 +3,14 @@ import type {
   AdminStats,
   AlertPage,
   AuditLogPage,
+  ChatResponse,
   ConversationDetail,
   ConversationSummary,
   DeleteHistoryResult,
   DocumentDetail,
   DocumentSummary,
+  LocalFileEntry,
   Me,
-  MessageOut,
   PolicyMatrix,
   UserOut,
 } from '../types'
@@ -67,11 +68,22 @@ export function updateDocument(
   return api.patch<DocumentDetail>(`/documents/${id}`, payload)
 }
 
-export function sendChatMessage(message: string, conversationId?: string) {
-  return api.post<{ conversation_id: string; message: MessageOut }>('/chat', {
+export function sendChatMessage(message: string, conversationId?: string, workspaceIndex?: LocalFileEntry[]) {
+  return api.post<ChatResponse>('/chat', {
     message,
     conversation_id: conversationId ?? null,
+    workspace_index: workspaceIndex ?? null,
   })
+}
+
+export function resumeChatMessage(payload: {
+  conversation_id: string
+  action_id: string
+  relative_path: string
+  name: string
+  content_base64: string
+}) {
+  return api.post<ChatResponse>('/chat/resume', payload)
 }
 
 export function listConversations() {

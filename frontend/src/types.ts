@@ -74,6 +74,31 @@ export interface MessageOut {
   created_at: string
 }
 
+// Local File Workspace (Phase 1, read-only) - see app/agent/local_files.py
+// and frontend/src/lib/localFs.ts. Metadata only; content is never part
+// of this type, it's read on demand and sent separately to /api/chat/resume.
+export interface LocalFileEntry {
+  name: string
+  relative_path: string
+  extension: string
+  size: number
+  modified_at: string | null
+  parent_folder: string | null
+}
+
+export interface PendingClientAction {
+  action_id: string
+  tool: string
+  relative_path: string
+  name: string
+}
+
+export interface ChatResponse {
+  conversation_id: string
+  message: MessageOut | null
+  pending_client_action: PendingClientAction | null
+}
+
 export interface ConversationSummary {
   id: string
   title: string
