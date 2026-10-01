@@ -17,6 +17,7 @@ class AlertOut(BaseModel):
     is_read: bool
     read_at: datetime | None
     created_at: datetime
+    audit_log_id: uuid.UUID | None = None
 
 
 class AlertPage(BaseModel):

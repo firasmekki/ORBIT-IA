@@ -97,6 +97,30 @@ def bootstrap_schema(conn: Connection) -> None:
     # frontend, see the Message model's docstring.
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS chart JSONB"))
 
+    # Soft-delete for "Supprimer l'historique" (routers/chat.py's
+    # delete_history) - see Conversation.deleted_at's docstring. Every read
+    # endpoint filters deleted_at IS NULL; the column is never the only
+    # trace of the deletion (the AuditLog row written in the same
+    # transaction is).
+    conn.execute(text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_conversations_deleted_at ON conversations (deleted_at)"))
+
+    # Links a Director-facing alert to the immutable audit_logs row that
+    # backs it - see Alert.audit_log_id's docstring.
+    conn.execute(text("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS audit_log_id UUID"))
+    conn.execute(
+        text(
+            "DO $$ BEGIN "
+            "IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints "
+            "WHERE constraint_name = 'alerts_audit_log_id_fkey') THEN "
+            "ALTER TABLE alerts ADD CONSTRAINT alerts_audit_log_id_fkey "
+            "FOREIGN KEY (audit_log_id) REFERENCES audit_logs(id) ON DELETE SET NULL; "
+            "END IF; "
+            "END $$;"
+        )
+    )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alerts_audit_log_id ON alerts (audit_log_id)"))
+
 
 def bootstrap_roles_and_grants(conn: Connection, settings: Settings) -> None:
     """Creates/refreshes `orbitia_app`, the low-privilege role the running

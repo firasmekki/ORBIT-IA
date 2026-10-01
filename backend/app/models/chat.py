@@ -15,6 +15,12 @@ class Conversation(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="Nouvelle conversation")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Soft delete only - see routers/chat.py's delete_history. The row (and
+    # its messages) are kept for traceability, never hard-deleted; every
+    # read endpoint filters deleted_at IS NULL. Deleting history is always
+    # audited (AuditLog "HISTORY_DELETED") in the same transaction as this
+    # column being set, never a bare UPDATE/DELETE on its own.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     messages: Mapped[list["Message"]] = relationship(back_populates="conversation", cascade="all, delete-orphan")
 

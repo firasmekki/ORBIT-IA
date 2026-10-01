@@ -42,6 +42,7 @@ os.environ["DATABASE_URL"] = os.environ.get(
 from app.core.config import get_settings  # noqa: E402
 from app.core.migrations import bootstrap_schema  # noqa: E402
 from app.core.security import hash_password  # noqa: E402
+from app.models.chat import Conversation, Message  # noqa: E402
 from app.models.document import CONFIDENTIALITY_RANK, Document, DocumentChunk, DocumentPage  # noqa: E402
 from app.models.user import User  # noqa: E402
 
@@ -86,7 +87,7 @@ def db(engine):
     session.execute(
         text(
             "TRUNCATE documents, document_pages, document_chunks, users, "
-            "audit_logs, alerts RESTART IDENTITY CASCADE"
+            "audit_logs, alerts, conversations, messages RESTART IDENTITY CASCADE"
         )
     )
     session.commit()
@@ -169,6 +170,22 @@ def make_test_user(db):
 @pytest.fixture
 def make_test_chunk(db):
     return lambda **kwargs: make_chunk(db, **kwargs)
+
+
+def make_conversation_with_messages(db, *, user_id, title="Conversation de test", message_count=1):
+    conv = Conversation(user_id=user_id, title=title)
+    db.add(conv)
+    db.commit()
+    db.refresh(conv)
+    for i in range(message_count):
+        db.add(Message(conversation_id=conv.id, role="user" if i % 2 == 0 else "assistant", content=f"message {i}"))
+    db.commit()
+    return conv
+
+
+@pytest.fixture
+def make_conversation(db):
+    return lambda **kwargs: make_conversation_with_messages(db, **kwargs)
 
 
 @pytest.fixture

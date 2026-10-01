@@ -58,3 +58,9 @@ class ConversationSummary(BaseModel):
 
 class ConversationDetail(ConversationSummary):
     messages: list[MessageOut]
+
+
+class DeleteHistoryResult(BaseModel):
+    deleted_conversation_count: int
+    deleted_message_count: int
+    audit_log_id: uuid.UUID | None
