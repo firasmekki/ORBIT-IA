@@ -1059,6 +1059,21 @@ table.data-table {
   height: calc(100vh - 56px - 48px);
 }
 
+/* The chat panel (and therefore any chart in it) needs the full viewport
+   width to stay readable below tablet size - same single-column collapse
+   pattern as .dashboard-split above. Doesn't touch .app-shell/.sidebar's
+   own (separate, pre-existing) lack of a mobile nav. */
+@media (max-width: 820px) {
+  .chat-layout {
+    grid-template-columns: 1fr;
+    height: auto;
+    min-height: calc(100vh - 56px - 48px);
+  }
+  .chat-history {
+    max-height: 180px;
+  }
+}
+
 .chat-history {
   display: flex;
   flex-direction: column;
@@ -1150,6 +1165,13 @@ table.data-table {
   display: flex;
   gap: 10px;
   max-width: 78%;
+}
+
+/* Charts need more horizontal room than prose to stay readable -
+   progressive enhancement, falls back to the 78% above in browsers
+   without :has() support. */
+.msg-row.assistant:has(.chart-block) {
+  max-width: 96%;
 }
 
 .msg-row.user {
@@ -1244,6 +1266,139 @@ table.data-table {
 
 .source-item-excerpt {
   color: var(--text-muted);
+}
+
+.chart-block {
+  /* Self-contained chart chrome: in light mode these fall back to the
+     app's existing tokens (zero visual change), but the chart card also
+     carries its own dark-mode values below - so it reads correctly in a
+     dark OS/browser even before the rest of the app has a dark theme. */
+  --chart-surface: var(--surface);
+  --chart-surface-alt: var(--surface-alt);
+  --chart-ink: var(--text);
+  --chart-ink-muted: var(--text-muted);
+  --chart-border: var(--border);
+  --chart-grid: var(--border);
+  /* Categorical series palette - fixed order (never cycled/reassigned per
+     filter), validated for CVD-safe adjacent contrast with
+     dataviz skill's validate_palette.js (worst adjacent ΔE 12.8 light,
+     9.7 dark - always paired with the legend below, never color-alone). */
+  --chart-series-1: #2f6fed;
+  --chart-series-2: #e8a13d;
+  --chart-series-3: #2f7d4e;
+  --chart-series-4: #b3402a;
+  --chart-series-5: #7a5cd6;
+  --chart-series-6: #1f9e9e;
+
+  margin-top: 8px;
+  padding: 16px 18px 8px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--chart-border);
+  background: var(--chart-surface);
+}
+
+@media (prefers-color-scheme: dark) {
+  .chart-block {
+    --chart-surface: #1a1a19;
+    --chart-surface-alt: #22221f;
+    --chart-ink: #ffffff;
+    --chart-ink-muted: #c3c2b7;
+    --chart-border: #2c2c2a;
+    --chart-grid: #2c2c2a;
+    --chart-series-1: #3987e5;
+    --chart-series-2: #c98500;
+    --chart-series-3: #199e70;
+    --chart-series-4: #e66767;
+    --chart-series-5: #9085e9;
+    --chart-series-6: #d95926;
+  }
+}
+
+.chart-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--chart-ink);
+}
+
+.chart-subtitle {
+  font-size: 11.5px;
+  color: var(--chart-ink-muted);
+  margin-top: 1px;
+  margin-bottom: 10px;
+}
+
+.chart-canvas {
+  width: 100%;
+}
+
+.chart-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  border-top: 1px dashed var(--chart-border);
+  margin-top: 4px;
+  padding-top: 8px;
+  padding-bottom: 6px;
+}
+
+.chart-source-tag {
+  font-size: 11px;
+  color: var(--chart-ink-muted);
+  background: var(--chart-surface-alt);
+  border-radius: var(--radius-sm);
+  padding: 3px 8px;
+}
+
+/* Custom tooltip (replaces Recharts' default box) - see
+   dataviz skill's interaction.md: values lead (bold/primary ink), series
+   name follows (secondary ink), a short line-key (not a filled box) gives
+   identity, exact values never compacted. */
+.chart-tooltip {
+  background: var(--chart-surface);
+  border: 1px solid var(--chart-border);
+  border-radius: 11px;
+  padding: 10px 13px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+  min-width: 140px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .chart-tooltip {
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  }
+}
+
+.chart-tooltip-header {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--chart-ink);
+  margin-bottom: 6px;
+}
+
+.chart-tooltip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.chart-tooltip-key {
+  width: 10px;
+  height: 2px;
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+.chart-tooltip-name {
+  color: var(--chart-ink-muted);
+  flex: 1;
+}
+
+.chart-tooltip-value {
+  color: var(--chart-ink);
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 details.tool-trace {

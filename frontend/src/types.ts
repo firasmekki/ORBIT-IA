@@ -39,12 +39,38 @@ export interface ToolTraceEntry {
   reason: string
 }
 
+export type ChartType = 'line' | 'bar' | 'pie' | 'scatter'
+
+export interface ChartValueField {
+  field: string
+  label: string
+  unit: string | null
+}
+
+export interface ChartSourceRef {
+  document_id: string | null
+  title: string
+  page: number | null
+  section: string | null
+}
+
+export interface ChartSpec {
+  chart_type: ChartType
+  title: string
+  category_field: string | null
+  category_label: string | null
+  value_fields: ChartValueField[]
+  data: Record<string, unknown>[]
+  sources: ChartSourceRef[]
+}
+
 export interface MessageOut {
   id: string
   role: 'user' | 'assistant'
   content: string
   sources: SourceRef[]
   tool_trace: ToolTraceEntry[]
+  chart?: ChartSpec | null
   created_at: string
 }
 

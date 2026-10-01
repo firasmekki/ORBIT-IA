@@ -3,6 +3,7 @@ import { getConversation, listConversations, sendChatMessage } from '../api/endp
 import { ApiError } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 import { ConfidentialityBadge, DecisionBadge } from '../components/Badges'
+import { ChartBlock } from '../components/ChartBlock'
 import { toolLabel } from '../lib/tools'
 import type { ConversationSummary, MessageOut } from '../types'
 
@@ -161,6 +162,8 @@ export function ChatPage() {
                 <div className="msg-avatar">{msg.role === 'user' ? (user?.full_name[0] ?? 'U') : 'IA'}</div>
                 <div style={{ minWidth: 0 }}>
                   <div className="msg-bubble">{msg.content}</div>
+
+                  {msg.chart && <ChartBlock spec={msg.chart} />}
 
                   {(msg.sources.length > 0 || msg.tool_trace.length > 0) && (
                     <div className="msg-meta">

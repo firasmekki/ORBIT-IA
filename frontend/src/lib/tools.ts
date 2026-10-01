@@ -7,6 +7,8 @@ export const TOOL_LABELS: Record<string, string> = {
   get_document: 'Consultation d’un document',
   search_database: 'Recherche dans les données financières',
   get_company_information: 'Informations générales de l’entreprise',
+  generate_chart: 'Génération de graphique',
+  read_spreadsheet_data: 'Lecture d’un fichier Excel',
 }
 
 export function toolLabel(name: string): string {
