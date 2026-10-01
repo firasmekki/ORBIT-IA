@@ -19,9 +19,47 @@ class ToolTraceEntry(BaseModel):
     reason: str
 
 
+class LocalFileEntry(BaseModel):
+    """One entry of the lightweight workspace index the frontend builds by
+    walking the user's chosen FileSystemDirectoryHandle - metadata only,
+    never content. See app/agent/local_files.py."""
+
+    name: str
+    relative_path: str
+    extension: str
+    size: int
+    modified_at: datetime | None = None
+    parent_folder: str | None = None
+
+
+class PendingClientAction(BaseModel):
+    """Returned instead of a final answer when the agent needs a local
+    file's content it doesn't have yet - the backend never has disk
+    access, so the frontend (which holds the real directory handle) must
+    execute this and POST the result to /api/chat/resume."""
+
+    action_id: uuid.UUID
+    tool: str
+    relative_path: str
+    name: str
+
+
 class ChatRequest(BaseModel):
     message: str
     conversation_id: uuid.UUID | None = None
+    # Present only when the user has an active local workspace - the
+    # frontend sends this lightweight index (metadata only) with every
+    # message so the Local File Agent can resolve "lis rapport.pdf"
+    # without ever uploading the workspace's actual content.
+    workspace_index: list[LocalFileEntry] | None = None
+
+
+class ChatResumeRequest(BaseModel):
+    conversation_id: uuid.UUID
+    action_id: uuid.UUID
+    relative_path: str
+    name: str
+    content_base64: str
 
 
 class MessageOut(BaseModel):
@@ -47,7 +85,13 @@ class MessageOut(BaseModel):
 
 class ChatResponse(BaseModel):
     conversation_id: uuid.UUID
-    message: MessageOut
+    # Exactly one of the two is set: `message` for a completed turn,
+    # `pending_client_action` when the agent needs a local file's content
+    # from the frontend before it can answer - nothing is persisted to
+    # the DB for a pending turn (see routers/chat.py::chat), so `message`
+    # has no row to point to yet.
+    message: MessageOut | None = None
+    pending_client_action: PendingClientAction | None = None
 
 
 class ConversationSummary(BaseModel):

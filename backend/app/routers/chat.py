@@ -1,10 +1,12 @@
+import base64
 import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.agent.orchestrator import run_agent_turn
+from app.agent.local_files import is_safe_relative_path
+from app.agent.orchestrator import AgentTurnResult, run_agent_turn
 from app.core.alert_service import create_alert
 from app.core.audit_logger import log_event
 from app.core.database import get_db
@@ -17,10 +19,12 @@ from app.policy.rules import ROLE_ACCESS, resolve_effective_grant
 from app.schemas.chat import (
     ChatRequest,
     ChatResponse,
+    ChatResumeRequest,
     ConversationDetail,
     ConversationSummary,
     DeleteHistoryResult,
     MessageOut,
+    PendingClientAction,
 )
 
 router = APIRouter(prefix="/api", tags=["chat"])
@@ -275,7 +279,94 @@ async def chat(
         message=payload.message,
         history=history,
         last_reference_context=last_reference_context,
+        workspace_index=payload.workspace_index,
     )
+
+    return _persist_assistant_turn(db, conv=conv, user=user, original_message=payload.message, result=result)
+
+
+@router.post("/chat/resume", response_model=ChatResponse)
+async def chat_resume(
+    payload: ChatResumeRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+) -> ChatResponse:
+    """Completes a turn the Local File Agent paused on (see
+    app/agent/orchestrator.py's pending_client_action) - the frontend has
+    now read the requested file via its own FileSystemDirectoryHandle (the
+    backend never had disk access) and POSTs the bytes here. Stateless by
+    design: nothing about the pending turn was persisted server-side, so
+    this recovers the original question from the conversation's own last
+    user Message row rather than requiring the frontend to resend it.
+    """
+    if not is_safe_relative_path(payload.relative_path):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Chemin de fichier invalide.")
+
+    conv = db.get(Conversation, payload.conversation_id)
+    if conv is None or conv.user_id != user.id or conv.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation introuvable.")
+
+    last_user_msg = (
+        db.query(Message)
+        .filter(Message.conversation_id == conv.id, Message.role == "user")
+        .order_by(Message.created_at.desc())
+        .first()
+    )
+    if last_user_msg is None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Aucune question en attente pour cette conversation.")
+
+    try:
+        content = base64.b64decode(payload.content_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Contenu de fichier invalide.") from None
+
+    grant = resolve_effective_grant(user)
+    if grant is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Votre rôle n'est pas reconnu par le système de permissions.")
+
+    result = await run_agent_turn(
+        user_id=str(user.id),
+        grant=grant,
+        message=last_user_msg.content,
+        history=[],
+        client_file_content=content,
+        client_file_name=payload.name,
+    )
+
+    # Local file reads bypass the company RBAC/ACL system by design (it's
+    # the user's own disk, not a shared resource - see
+    # _run_local_file_turn's docstring), but every read is still audited
+    # for traceability, same as every other action in this app.
+    log_event(
+        user_id=user.id,
+        username=user.username,
+        role=user.role,
+        action="FILE_READ",
+        decision="ALLOW",
+        resource_type="LOCAL_FILE",
+        resource_id=payload.relative_path,
+        reason="ok",
+        extra={"name": payload.name, "action_id": str(payload.action_id), "size_bytes": len(content)},
+    )
+
+    return _persist_assistant_turn(db, conv=conv, user=user, original_message=last_user_msg.content, result=result)
+
+
+def _persist_assistant_turn(
+    db: Session, *, conv: Conversation, user: User, original_message: str, result: AgentTurnResult
+) -> ChatResponse:
+    """Shared tail for chat()/chat_resume(): either the turn is still
+    pending a client-side file read (nothing persisted yet - there is no
+    answer to save), or it's complete and gets persisted/audited exactly
+    like every chat turn always has."""
+    if result.pending_client_action is not None:
+        return ChatResponse(
+            conversation_id=conv.id,
+            pending_client_action=PendingClientAction(
+                action_id=uuid.uuid4(),
+                tool=result.pending_client_action["tool"],
+                relative_path=result.pending_client_action["relative_path"],
+                name=result.pending_client_action["name"],
+            ),
+        )
 
     assistant_msg = Message(
         conversation_id=conv.id,
@@ -304,7 +395,7 @@ async def chat(
         resource_type="conversation",
         resource_id=str(conv.id),
         reason="one or more tool calls were denied" if denied_calls else "ok",
-        extra={"message_preview": payload.message[:200], "tool_trace": result.tool_trace, "degraded": result.degraded},
+        extra={"message_preview": original_message[:200], "tool_trace": result.tool_trace, "degraded": result.degraded},
     )
 
     if policy_denials:
@@ -315,7 +406,7 @@ async def chat(
             username=user.username,
             role=user.role,
             title=f"Tentative d'accès refusée dans l'assistant IA ({user.full_name})",
-            description=f"Question posée : « {payload.message[:300]} »\nRefus : {reasons}",
+            description=f"Question posée : « {original_message[:300]} »\nRefus : {reasons}",
             resource_type="conversation",
             resource_id=str(conv.id),
         )

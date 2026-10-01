@@ -34,6 +34,7 @@ from app.agent.intent import (
     detect_section_request,
     detect_spreadsheet_reference,
 )
+from app.agent.local_files import detect_local_file_intent, resolve_file_in_index
 from app.agent.llm_client import LLMServiceError, chat_completion
 from app.agent.mcp_client import call_tool, open_mcp_session
 from app.core.security import mint_internal_token
@@ -266,11 +267,39 @@ class AgentTurnResult:
     # the assistant Message row and sent to the frontend as-is - unlike
     # reference_context this one IS user-visible (app/models/chat.py).
     chart: dict | None = None
+    # Set instead of a real answer when the Local File Agent needs a local
+    # file's content the backend doesn't have (the backend never has disk
+    # access - see app/agent/local_files.py). The caller (routers/chat.py)
+    # must NOT persist a Message for this turn - there is nothing to save
+    # yet, the turn isn't finished (see /api/chat/resume).
+    pending_client_action: dict | None = None
 
 
 async def run_agent_turn(
-    *, user_id: str, grant: Grant, message: str, history: list[dict], last_reference_context: dict | None = None
+    *,
+    user_id: str,
+    grant: Grant,
+    message: str,
+    history: list[dict],
+    last_reference_context: dict | None = None,
+    workspace_index: list | None = None,
+    client_file_content: bytes | None = None,
+    client_file_name: str | None = None,
 ) -> AgentTurnResult:
+    # Local File Agent: entirely separate from the MCP/RAG path below (no
+    # MCP session, no department/confidentiality ACL - a user's own local
+    # files aren't a company resource, that's a different trust boundary).
+    # Gated on workspace_index or an already-resolved client_file_content
+    # (the /api/chat/resume case, where the index isn't needed again) being
+    # present, so a user who has never activated a workspace sees
+    # byte-for-byte the same behavior as before this feature existed.
+    if workspace_index or client_file_content is not None:
+        local_result = await _run_local_file_turn(
+            message, workspace_index or [], client_file_content, client_file_name
+        )
+        if local_result is not None:
+            return local_result
+
     tools_schema = [TOOL_DEFINITIONS[name] for name in TOOL_DEFINITIONS if name in grant.tools]
     internal_token = mint_internal_token(
         user_id=user_id, role=grant.role, departments=sorted(grant.departments), max_level=grant.max_level
@@ -555,6 +584,85 @@ async def _ground_with_database(
             }
         )
     return None
+
+
+async def _run_local_file_turn(
+    message: str,
+    workspace_index: list,
+    client_file_content: bytes | None,
+    client_file_name: str | None,
+) -> AgentTurnResult | None:
+    """Two-pass Local File Agent turn. First pass (client_file_content is
+    None): detect the intent, resolve the filename against the client-
+    supplied index, and return a pending_client_action - the backend
+    cannot read the file itself, only the frontend (holding the real
+    FileSystemDirectoryHandle) can. Second pass (resume, content now
+    provided): extract text from the bytes the frontend just read and
+    ground the LLM with it, exactly like _ground_with_search does for
+    company documents except the excerpt comes from the user's own local
+    file, never from MCP/RAG - no department/confidentiality ACL applies,
+    this isn't a company resource.
+
+    Returns None (not an AgentTurnResult) when the message isn't a local-
+    file request at all, so the caller falls through to the normal
+    RAG/chart/MCP pipeline unchanged.
+    """
+    intent = detect_local_file_intent(message)
+    if intent is None:
+        return None
+
+    if client_file_content is None:
+        match = resolve_file_in_index(intent.filename_hint, workspace_index)
+        if match is None:
+            return AgentTurnResult(answer=f"Je ne trouve pas « {intent.filename_hint} » dans le workspace actif.")
+        if isinstance(match, list):
+            choices = ", ".join(f"« {m.relative_path} »" for m in match)
+            return AgentTurnResult(
+                answer=f"Plusieurs fichiers correspondent à « {intent.filename_hint} » : {choices}. Lequel voulez-vous ?"
+            )
+        return AgentTurnResult(
+            answer="",
+            pending_client_action={
+                "tool": "read_local_file",
+                "relative_path": match.relative_path,
+                "name": match.name,
+            },
+        )
+
+    from app.rag.extract import ExtractionError, UnsupportedFileTypeError, extract
+
+    try:
+        extraction = extract(client_file_name or "fichier", client_file_content)
+    except UnsupportedFileTypeError as exc:
+        return AgentTurnResult(answer=f"Ce format n'est pas encore pris en charge : {exc}")
+    except ExtractionError as exc:
+        return AgentTurnResult(answer=f"Impossible de lire ce fichier : {exc}")
+
+    # Context window is bounded for the local model - same rationale as
+    # _ground_with_search's excerpt capping, just applied to one whole
+    # file instead of several short RAG excerpts.
+    excerpt = extraction.text[:6000]
+    prompt_messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": (
+                f"Contenu du fichier local « {client_file_name} », fourni directement par l'utilisateur depuis "
+                "son workspace (ce n'est pas un document de l'entreprise) :\n\n"
+                f"{excerpt}\n\nRéponds à la question de l'utilisateur en te basant uniquement sur ce contenu."
+            ),
+        },
+        {"role": "user", "content": message},
+    ]
+    try:
+        assistant_message = await chat_completion(prompt_messages)
+    except LLMServiceError:
+        return AgentTurnResult(
+            answer=f"[Mode dégradé - modèle local indisponible] Extrait de « {client_file_name} » :\n\n{excerpt[:1000]}",
+            degraded=True,
+        )
+    answer = assistant_message.get("content") or "Je n'ai pas de réponse à formuler."
+    return AgentTurnResult(answer=answer)
 
 
 async def _run_search_keyword(session, keyword: str, whole_word: bool, tool_trace: list[dict]) -> AgentTurnResult:
