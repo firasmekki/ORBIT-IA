@@ -96,6 +96,7 @@ async def chat(
         sources=result.sources,
         tool_trace=result.tool_trace,
         reference_context=result.reference_context,
+        chart=result.chart,
     )
     db.add(assistant_msg)
     db.commit()
@@ -139,6 +140,7 @@ async def chat(
             content=assistant_msg.content,
             sources=assistant_msg.sources or [],
             tool_trace=assistant_msg.tool_trace or [],
+            chart=assistant_msg.chart,
             created_at=assistant_msg.created_at,
         ),
     )

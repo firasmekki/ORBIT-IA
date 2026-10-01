@@ -329,3 +329,128 @@ def detect_section_request(message: str) -> SectionRequest | None:
         document_name=document_name,
         use_context_document=use_context_document,
     )
+
+
+# --- generate_chart intent --------------------------------------------------
+#
+# Same split as everything above: a trigger confirms "the user wants a
+# visualization", type-keywords (when present) pick line/bar/pie/scatter.
+# No type-word at all -> chart_type=None, left for the orchestrator to
+# default sensibly (see _run_generate_chart) or ask, per the brief's "si le
+# choix reste réellement ambigu -> demander une clarification". A bare data
+# question ("Quel est le chiffre d'affaires ?") must never trigger this -
+# every path below requires an explicit visualization verb/noun, not just
+# a data-sounding subject.
+
+# --- explicit file/sheet reference (priority data source for charts) -----
+#
+# Deliberately dumb extraction, same philosophy as the rest of this module:
+# just enough to hand a candidate filename/sheet name to
+# read_spreadsheet_data's own ACL-scoped resolution (app/mcp/server.py),
+# which is the actual authority on whether it exists/is authorized - this
+# only decides "does the message look like it's naming one".
+
+_FILE_HINT_RE = re.compile(r"\b([\w\-]+\.(?:xlsx|xls|csv))\b", re.IGNORECASE)
+_SHEET_HINT_RE = re.compile(
+    r"feuille\s*[:\s]\s*[«\"]?\s*([^,.\n]+?)\s*(?=[,.\n]|$|\bpour\b|\bcolonne\b|\baffiche\b|\bcompare\b)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class SpreadsheetReference:
+    file_hint: str | None
+    sheet_hint: str | None
+
+
+def detect_spreadsheet_reference(message: str) -> SpreadsheetReference | None:
+    file_match = _FILE_HINT_RE.search(message)
+    sheet_match = _SHEET_HINT_RE.search(message)
+    file_hint = file_match.group(1) if file_match else None
+    sheet_hint = sheet_match.group(1).strip(_STRIP_CHARS + " ") if sheet_match else None
+    if not file_hint and not sheet_hint:
+        return None
+    return SpreadsheetReference(file_hint=file_hint, sheet_hint=sheet_hint or None)
+
+
+_CHART_TYPE_WORDS: dict[str, tuple[str, ...]] = {
+    # Order matters: scatter/pie's more specific phrases are checked before
+    # the shorter, more general bar/line ones so e.g. "relation entre" (
+    # scatter) never gets shadowed by an incidental "comparaison" match.
+    "scatter": ("nuage de points", "scatter", "corrélation", "relation entre"),
+    "pie": ("camembert", "circulaire", "répartition", "proportion", "parts de", "pie chart"),
+    "line": ("courbe", "évolution", "tendance", "line chart"),
+    "bar": ("histogramme", "barres", "classement", "bar chart"),
+}
+
+_GENERIC_CHART_TRIGGER = re.compile(r"\b(?:graphique|diagramme|visualis[eé]r?|visualisation)\b", re.IGNORECASE)
+_CHART_VERB_RE = re.compile(r"\b(?:affiche|montre|fais|g[ée]n[èe]re|cr[ée]e[rz]?)\b", re.IGNORECASE)
+# "compare" alone is ambiguous with a future compare_documents tool (not
+# built yet) - only counted as a chart signal when the subject is clearly
+# numeric/data, not "compare ces deux documents".
+_CHART_DATA_NOUNS_RE = re.compile(
+    r"\b(?:ventes?|budgets?|d[ée]penses?|revenus?|chiffre d'affaires|produits?|d[ée]partements?|co[uû]ts?)\b",
+    re.IGNORECASE,
+)
+_COMPARE_RE = re.compile(r"\bcompar[eèz]\w*\b", re.IGNORECASE)
+# Wider than _CHART_VERB_RE: an explicit file/sheet reference (see
+# detect_spreadsheet_reference above) already carries most of the intent
+# signal on its own, so a softer action verb - "compare"/"utilise" as well
+# as the usual affiche/montre/fais/génère/crée - is enough alongside it.
+# Never used on its own (only combined with a spreadsheet reference below),
+# so it doesn't loosen the bare-data-question guard for every other message.
+_CHART_OR_SPREADSHEET_VERB_RE = re.compile(
+    r"\b(?:affiche|montre|fais|g[ée]n[èe]re|cr[ée]e[rz]?|compar[eèz]\w*|utilise[rz]?)\b", re.IGNORECASE
+)
+
+_TRIGGER_WORD_STRIP_RE = re.compile(
+    r"\b(?:affiche|montre|fais|g[ée]n[èe]re|cr[ée]e[rz]?|graphique|diagramme|visualis[eé]r?|visualisation|"
+    r"courbe|évolution|tendance|histogramme|barres|classement|camembert|circulaire|répartition|proportion|"
+    r"nuage de points|scatter|corrélation|relation entre|compar[eèz]\w*|une?|des?|du|de|le|la|les|moi|-moi)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class ChartIntent:
+    chart_type: str | None  # None = no explicit type word, orchestrator decides
+    subject: str  # message with trigger/filler words stripped - used as the search_database query
+
+
+def detect_chart_intent(message: str) -> ChartIntent | None:
+    lowered = message.lower()
+
+    matched_type = None
+    for chart_type, words in _CHART_TYPE_WORDS.items():
+        if any(w in lowered for w in words):
+            matched_type = chart_type
+            break
+
+    has_generic = bool(_GENERIC_CHART_TRIGGER.search(message))
+    # "visualise"/"visualiser" already carries its own imperative - doesn't
+    # need a separate affiche/montre/fais alongside it the way "graphique"
+    # or "diagramme" (nouns) do.
+    is_self_sufficient_trigger = bool(re.search(r"\bvisualis", message, re.IGNORECASE))
+    has_verb = bool(_CHART_VERB_RE.search(message))
+    has_data_compare = bool(_COMPARE_RE.search(message)) and bool(_CHART_DATA_NOUNS_RE.search(message))
+    # An explicit "fichier X.xlsx" / "feuille Y" reference plus any
+    # reasonably action-ish verb is unambiguous chart-from-spreadsheet
+    # intent, even without a "graphique"/"courbe" word - see
+    # app/agent/orchestrator.py::_run_chart_from_spreadsheet.
+    has_spreadsheet_request = bool(detect_spreadsheet_reference(message)) and bool(
+        _CHART_OR_SPREADSHEET_VERB_RE.search(message)
+    )
+
+    if (
+        matched_type is None
+        and not (has_generic and has_verb)
+        and not is_self_sufficient_trigger
+        and not has_data_compare
+        and not has_spreadsheet_request
+    ):
+        return None
+    if matched_type is None and has_data_compare:
+        matched_type = "bar"
+
+    subject = _TRIGGER_WORD_STRIP_RE.sub(" ", message).strip(_STRIP_CHARS + " ")
+    return ChartIntent(chart_type=matched_type, subject=subject)

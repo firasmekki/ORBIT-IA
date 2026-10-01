@@ -30,6 +30,7 @@ class MessageOut(BaseModel):
     content: str
     sources: list[SourceRef] = []
     tool_trace: list[ToolTraceEntry] = []
+    chart: dict | None = None
     created_at: datetime
 
     # User messages have NULL sources/tool_trace in the DB (nullable

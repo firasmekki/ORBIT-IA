@@ -13,13 +13,45 @@ Security invariants enforced here:
 """
 
 import json
+import logging
 from dataclasses import dataclass, field
 
-from app.agent.intent import SectionRequest, detect_keyword_intent, detect_list_documents_intent, detect_section_request
+from app.agent.chart import (
+    ChartValidationError,
+    extract_unit,
+    parse_inline_data,
+    resolve_spreadsheet_columns,
+    strip_parenthetical,
+    summarize_chart,
+)
+from app.agent.intent import (
+    ChartIntent,
+    SectionRequest,
+    SpreadsheetReference,
+    detect_chart_intent,
+    detect_keyword_intent,
+    detect_list_documents_intent,
+    detect_section_request,
+    detect_spreadsheet_reference,
+)
 from app.agent.llm_client import LLMServiceError, chat_completion
 from app.agent.mcp_client import call_tool, open_mcp_session
 from app.core.security import mint_internal_token
 from app.policy.rules import Grant
+from app.rag.normalize import normalize
+
+logger = logging.getLogger("orbitia.chart")
+
+
+def _chart_debug(**fields) -> None:
+    """Temporary structured tracing for the chart data-source pipeline
+    (file/sheet resolution routing was a real, hard-to-see-in-tests bug
+    once - see git history) - one [CHART DEBUG] line per field so `docker
+    compose logs backend | grep "CHART DEBUG" -A1` shows the exact decision
+    trail for a single turn without wading through the rest of the log."""
+    for key, value in fields.items():
+        logger.info("[CHART DEBUG]\n%s=%s", key, value)
+
 
 MAX_TOOL_ITERATIONS = 4
 
@@ -151,6 +183,48 @@ TOOL_DEFINITIONS: dict[str, dict] = {
             },
         },
     },
+    "read_spreadsheet_data": {
+        "type": "function",
+        "function": {
+            "name": "read_spreadsheet_data",
+            "description": (
+                "Lit les lignes/colonnes exactes d'une feuille d'un classeur Excel (.xlsx) interne "
+                "autorisé. À utiliser, jamais search_database, quand l'utilisateur nomme un fichier ou "
+                "une feuille précis."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string", "description": "Identifiant (UUID) du document"},
+                    "document_name": {"type": "string", "description": "Nom du fichier ou titre du document"},
+                    "sheet_name": {"type": "string", "description": "Nom de la feuille"},
+                },
+                "required": [],
+            },
+        },
+    },
+    "generate_chart": {
+        "type": "function",
+        "function": {
+            "name": "generate_chart",
+            "description": (
+                "Génère un graphique (ligne, barres, camembert ou nuage de points) à partir de données "
+                "déjà vérifiées (search_database ou données fournies explicitement par l'utilisateur). "
+                "Ne récupère et n'invente aucune donnée lui-même."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chart_type": {"type": "string", "description": "line, bar, pie ou scatter"},
+                    "title": {"type": "string", "description": "Titre du graphique"},
+                    "category_field": {"type": "string", "description": "Nom du champ de catégorie (axe X)"},
+                    "value_fields": {"type": "array", "description": "Séries de valeurs à tracer"},
+                    "data": {"type": "array", "description": "Lignes de données"},
+                },
+                "required": ["chart_type", "title", "value_fields", "data"],
+            },
+        },
+    },
 }
 
 SYSTEM_PROMPT = """Tu es l'assistant IA interne d'Orbitia. Tu réponds aux employés en te \
@@ -188,6 +262,10 @@ class AgentTurnResult:
     # persisted on the assistant Message row (see app/models/chat.py),
     # never sent to the frontend. None means "nothing to follow up on".
     reference_context: dict | None = None
+    # Structured chart spec (see app/agent/chart.py::ChartSpec), persisted on
+    # the assistant Message row and sent to the frontend as-is - unlike
+    # reference_context this one IS user-visible (app/models/chat.py).
+    chart: dict | None = None
 
 
 async def run_agent_turn(
@@ -226,6 +304,11 @@ async def run_agent_turn(
                     return await _run_get_document_section(
                         session, section_request, last_reference_context, tool_trace
                     )
+
+            if "generate_chart" in grant.tools:
+                chart_intent = detect_chart_intent(message)
+                if chart_intent is not None:
+                    return await _run_generate_chart(session, grant, chart_intent, message, tool_trace)
 
             early_result = await _ground_with_search(
                 session, message, tool_trace, sources_by_doc, messages, reference_context_holder
@@ -626,6 +709,246 @@ def _format_list_documents_result(result: dict) -> str:
             f"- {doc['title']}{type_label} — {doc['department']} / {doc['confidentiality']}{author_label} — {date_label}"
         )
     return "\n".join(lines)
+
+
+async def _run_generate_chart(
+    session, grant: Grant, intent: ChartIntent, message: str, tool_trace: list[dict]
+) -> AgentTurnResult:
+    """Voie A for chart requests: resolves `data` in strict priority order -
+    an explicitly named spreadsheet file/sheet (_run_chart_from_spreadsheet)
+    first, then numbers typed in this message (parse_inline_data), then
+    search_database - then hands off to the generate_chart tool for
+    structural validation. Never lets the LLM invent or reformat numbers;
+    the short analysis text is computed by summarize_chart from the same
+    validated data, not generated. An explicit file/sheet reference that
+    fails to resolve is a hard error - it never silently falls through to
+    inline data or search_database (see _run_chart_from_spreadsheet).
+
+    search_database's own data (FinancialRecord: label/department/
+    confidentiality/amount/year, no month, one numeric metric) is why a
+    chart built from IT falls back to "label"/"amount" and a scatter
+    request against it naturally fails validation (needs two numeric
+    series) rather than fabricating a second metric.
+    """
+    _chart_debug(user_request=message, chart_intent=intent)
+
+    spreadsheet_ref = detect_spreadsheet_reference(message) if "read_spreadsheet_data" in grant.tools else None
+    _chart_debug(
+        spreadsheet_detected=spreadsheet_ref is not None,
+        requested_file=spreadsheet_ref.file_hint if spreadsheet_ref else None,
+        requested_sheet=spreadsheet_ref.sheet_hint if spreadsheet_ref else None,
+    )
+    if spreadsheet_ref is not None:
+        _chart_debug(selected_route="spreadsheet", selected_tool="read_spreadsheet_data")
+        return await _run_chart_from_spreadsheet(session, intent, spreadsheet_ref, message, tool_trace)
+
+    inline = parse_inline_data(message)
+    category_field = "label"
+    category_label = "Catégorie"
+    value_fields = [{"field": "amount", "label": "Montant", "unit": "€"}]
+
+    if inline is not None:
+        _chart_debug(selected_route="inline_data", selected_tool="generate_chart")
+        data = [{"label": label, "amount": value} for label, value in inline]
+        sources: list[dict] = []
+    elif "search_database" in grant.tools:
+        _chart_debug(selected_route="search_database", selected_tool="search_database")
+        query = intent.subject or message
+        result = await call_tool(session, "search_database", {"query": query})
+        decision = "DENY" if "error" in result else "ALLOW"
+        tool_trace.append(
+            {
+                "tool": "search_database",
+                "arguments": {"query": query},
+                "decision": decision,
+                "reason": result.get("error", "ok"),
+            }
+        )
+        if decision == "DENY":
+            if result.get("service_unavailable"):
+                return AgentTurnResult(
+                    answer="Le service de données financières est momentanément indisponible. Réessayez dans un instant.",
+                    tool_trace=tool_trace,
+                    degraded=True,
+                )
+            return AgentTurnResult(answer=f"Accès refusé : {result['error']}", tool_trace=tool_trace, degraded=True)
+
+        rows = result.get("results", [])
+        if not rows:
+            return AgentTurnResult(
+                answer="Aucune donnée autorisée n'a été trouvée pour construire ce graphique.",
+                tool_trace=tool_trace,
+            )
+        data = [{"label": r["label"], "amount": r["amount"]} for r in rows]
+        sources = []
+    else:
+        _chart_debug(selected_route="no_data_available", selected_tool=None)
+        return AgentTurnResult(
+            answer=(
+                "Je n'ai pas de données à visualiser : indiquez les chiffres directement dans votre message "
+                "(ex. « Janvier: 120000, Février: 135000 ») ou reformulez votre demande."
+            ),
+            tool_trace=tool_trace,
+        )
+
+    chart_type = intent.chart_type or "bar"
+    raw_title = (intent.subject or message).strip().rstrip(".?!")
+    title = (raw_title[:1].upper() + raw_title[1:]) if raw_title else "Graphique"
+    return await _call_generate_chart_tool(
+        session, tool_trace, chart_type, title, category_field, category_label, value_fields, data, sources
+    )
+
+
+async def _call_generate_chart_tool(
+    session,
+    tool_trace: list[dict],
+    chart_type: str,
+    title: str,
+    category_field: str | None,
+    category_label: str | None,
+    value_fields: list[dict],
+    data: list[dict],
+    sources: list[dict],
+) -> AgentTurnResult:
+    """Shared tail for every chart data source (spreadsheet, inline,
+    search_database): calls generate_chart for its final structural
+    validation, then builds the deterministic summarize_chart-derived
+    answer. The one and only place that turns a resolved dataset into an
+    AgentTurnResult, so every source is held to the identical contract."""
+    arguments = {
+        "chart_type": chart_type,
+        "title": title,
+        "category_field": category_field,
+        "category_label": category_label,
+        "value_fields": value_fields,
+        "data": data,
+        "sources": sources,
+    }
+    result = await call_tool(session, "generate_chart", arguments)
+    decision = "DENY" if "error" in result else "ALLOW"
+    tool_trace.append(
+        {"tool": "generate_chart", "arguments": arguments, "decision": decision, "reason": result.get("error", "ok")}
+    )
+
+    if decision == "DENY":
+        if result.get("service_unavailable"):
+            return AgentTurnResult(
+                answer="Le service de graphiques est momentanément indisponible. Réessayez dans un instant.",
+                tool_trace=tool_trace,
+                degraded=True,
+            )
+        return AgentTurnResult(
+            answer=f"Impossible de générer ce graphique : {result['error']}", tool_trace=tool_trace, degraded=True
+        )
+
+    chart = result["chart"]
+    answer = summarize_chart(chart) or f"Voici le graphique demandé : {title}."
+    return AgentTurnResult(answer=answer, tool_trace=tool_trace, chart=chart)
+
+
+async def _run_chart_from_spreadsheet(
+    session, intent: ChartIntent, spreadsheet_ref: SpreadsheetReference, message: str, tool_trace: list[dict]
+) -> AgentTurnResult:
+    """Priority chart data source: an explicitly named file/sheet. Reads
+    the real sheet via read_spreadsheet_data, validates the resolved
+    file/sheet against what was actually requested (never silently
+    substitutes a different source), resolves which real columns to plot
+    (resolve_spreadsheet_columns - grounded in the sheet's own headers,
+    never guessed), and logs the exact diagnostic trail before calling
+    generate_chart. A file/sheet that can't be resolved, or an explicitly
+    named column that doesn't exist, is a hard error here - it never falls
+    through to inline data or search_database.
+    """
+    arguments = {"document_id": None, "document_name": spreadsheet_ref.file_hint, "sheet_name": spreadsheet_ref.sheet_hint}
+    _chart_debug(tool_arguments=arguments)
+    result = await call_tool(session, "read_spreadsheet_data", arguments)
+    decision = "DENY" if "error" in result else "ALLOW"
+    tool_trace.append(
+        {"tool": "read_spreadsheet_data", "arguments": arguments, "decision": decision, "reason": result.get("error", "ok")}
+    )
+
+    if decision == "DENY":
+        if result.get("service_unavailable"):
+            return AgentTurnResult(
+                answer="Le service de fichiers est momentanément indisponible. Réessayez dans un instant.",
+                tool_trace=tool_trace,
+                degraded=True,
+            )
+        error_kind = result.get("error_kind")
+        if error_kind in ("file_not_found", "ambiguous_file") and spreadsheet_ref.file_hint:
+            # The exact wording required: never let a resolution failure on
+            # an explicitly named file fall through to a generic message -
+            # or worse, to a different data source.
+            answer = f"Le fichier « {spreadsheet_ref.file_hint} » n'a pas été trouvé dans les sources autorisées."
+        else:
+            # Sheet-not-found / not-a-spreadsheet / other: the MCP tool's
+            # own message already names the file/sheet precisely.
+            answer = result["error"]
+        return AgentTurnResult(answer=answer, tool_trace=tool_trace)
+
+    resolved_title = result["title"]
+    resolved_source_filename = result.get("source_filename") or ""
+    resolved_sheet = result["sheet"]
+    _chart_debug(resolved_file=resolved_source_filename or resolved_title, resolved_sheet=resolved_sheet, row_count=result.get("row_count"))
+
+    # Priority-source validation: an explicit request must resolve to
+    # exactly what was asked, never a different document/sheet.
+    if spreadsheet_ref.file_hint:
+        requested_norm = normalize(spreadsheet_ref.file_hint)
+        if requested_norm not in normalize(resolved_title) and requested_norm not in normalize(resolved_source_filename):
+            logger.warning(
+                "chart file validation failed: requested=%r resolved_title=%r resolved_source_filename=%r",
+                spreadsheet_ref.file_hint, resolved_title, resolved_source_filename,
+            )
+            return AgentTurnResult(
+                answer=f"Le fichier « {spreadsheet_ref.file_hint} » n'a pas été trouvé dans les sources autorisées.",
+                tool_trace=tool_trace,
+            )
+    if spreadsheet_ref.sheet_hint and normalize(spreadsheet_ref.sheet_hint) not in normalize(resolved_sheet):
+        logger.warning(
+            "chart sheet validation failed: requested=%r resolved=%r", spreadsheet_ref.sheet_hint, resolved_sheet
+        )
+        return AgentTurnResult(
+            answer=f"La feuille « {spreadsheet_ref.sheet_hint} » n'a pas été trouvée dans « {resolved_title} ».",
+            tool_trace=tool_trace,
+        )
+
+    headers = result["columns"]
+    rows = result["rows"]
+
+    try:
+        category_field, value_headers = resolve_spreadsheet_columns(headers, rows, message)
+    except ChartValidationError as exc:
+        return AgentTurnResult(answer=f"Impossible de construire ce graphique : {exc}", tool_trace=tool_trace)
+
+    data = [{k: row.get(k) for k in ([category_field] if category_field else []) + value_headers} for row in rows]
+    value_fields = [{"field": h, "label": strip_parenthetical(h) or h, "unit": extract_unit(h)} for h in value_headers]
+    sources = [{"document_id": result["document_id"], "title": resolved_title, "page": None, "section": resolved_sheet}]
+
+    _chart_debug(
+        resolved_columns=[category_field, *value_headers],
+        dataset_sent_to_generate_chart=data,
+    )
+    logger.info(
+        "generate_chart diagnostic\n"
+        "REQUEST: %s\n"
+        "REQUESTED FILE: %s\nREQUESTED SHEET: %s\nREQUESTED X COLUMN: %s\nREQUESTED Y COLUMN: %s\n"
+        "RESOLVED FILE: %s\nRESOLVED SHEET: %s\nRESOLVED COLUMNS: %s\nSOURCE TYPE: spreadsheet\n"
+        "ROWS FOUND: %d\nFIRST ROW: %s\nLAST ROW: %s\nDATASET SENT TO generate_chart: %s",
+        message,
+        spreadsheet_ref.file_hint, spreadsheet_ref.sheet_hint, category_field, value_headers,
+        resolved_title, resolved_sheet, headers,
+        len(data), data[0] if data else None, data[-1] if data else None, data,
+    )
+
+    chart_type = intent.chart_type or "bar"
+    raw_title = (intent.subject or f"{resolved_title} - {resolved_sheet}").strip().rstrip(".?!")
+    title = (raw_title[:1].upper() + raw_title[1:]) if raw_title else resolved_sheet
+    category_label = strip_parenthetical(category_field) if category_field else None
+
+    return await _call_generate_chart_tool(
+        session, tool_trace, chart_type, title, category_field, category_label, value_fields, data, sources
+    )
 
 
 def _resolve_section_request(

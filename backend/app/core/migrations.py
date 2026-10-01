@@ -93,6 +93,10 @@ def bootstrap_schema(conn: Connection) -> None:
         )
     )
 
+    # generate_chart (app/agent/chart.py) - chart spec rendered by the
+    # frontend, see the Message model's docstring.
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS chart JSONB"))
+
 
 def bootstrap_roles_and_grants(conn: Connection, settings: Settings) -> None:
     """Creates/refreshes `orbitia_app`, the low-privilege role the running

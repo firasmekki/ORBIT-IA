@@ -23,9 +23,11 @@ import anyio
 from mcp.server.fastmcp import Context, FastMCP
 from sqlalchemy import func, or_, true
 
+from app.agent.chart import ChartValidationError, validate_chart_spec
 from app.core.alert_service import create_alert
 from app.core.audit_logger import log_event
 from app.core.database import SessionLocal
+from app.core.storage import download_file
 from app.mcp.context import IdentityError, extract_identity
 from app.models.document import Document, DocumentPage
 from app.models.finance import FinancialRecord
@@ -673,6 +675,282 @@ def _get_company_information_impl(user_id: str, topic: str) -> dict:
         db.close()
 
 
+SPREADSHEET_EXTENSIONS = {"xlsx"}
+
+
+def _resolve_spreadsheet_document(
+    db, grant: Grant, document_id: str | None, document_name: str | None
+) -> tuple[Document | None, dict | None]:
+    """Same resolution contract as _get_document_section_impl's document_id/
+    document_name lookup (exact-then-partial, ACL-scoped, ambiguous name ->
+    choices) - except it also matches the original filename
+    (`source_filename`), not just the title, since a user naming a
+    spreadsheet almost always types it with its extension
+    ("Orbitia_Test_Entreprise_Complet.xlsx"), which never appears in the
+    title (the extension is stripped at upload)."""
+    departments, max_rank = retrieval_scope(grant=grant)
+
+    if document_id:
+        try:
+            doc_uuid = uuid.UUID(document_id)
+        except ValueError:
+            return None, {"error": DOCUMENT_NOT_FOUND_OR_DENIED, "error_kind": "file_not_found"}
+        return db.get(Document, doc_uuid), None
+
+    normalized_name = normalize(document_name or "")
+    candidates: list[Document] = []
+    if departments:
+        candidates = (
+            db.query(Document)
+            .filter(Document.department.in_(departments), Document.confidentiality_rank <= max_rank)
+            .all()
+        )
+
+    def names(d: Document) -> list[str]:
+        return [normalize(d.title), normalize(d.source_filename or "")]
+
+    exact = [d for d in candidates if normalized_name in names(d)]
+    partial = [d for d in candidates if normalized_name and any(normalized_name in n for n in names(d))]
+    matches = exact or partial
+
+    if not matches:
+        return None, {"error": DOCUMENT_NOT_FOUND_OR_DENIED, "error_kind": "file_not_found"}
+    if len(matches) > 1:
+        titles = ", ".join(d.title for d in matches[:MAX_TITLE_CHOICES])
+        return None, {
+            "error": f"plusieurs documents correspondent à « {document_name} » ({titles}) - précisez lequel.",
+            "error_kind": "ambiguous_file",
+            "choices": [{"document_id": str(d.id), "title": d.title} for d in matches[:MAX_TITLE_CHOICES]],
+        }
+    return matches[0], None
+
+
+def _resolve_spreadsheet_sheet(db, doc: Document, sheet_name: str | None) -> tuple[str | None, dict | None]:
+    """Sheet names are resolved against the real DocumentPage.section values
+    recorded at ingestion (one per sheet, see app/rag/extract.py's
+    _extract_xlsx_blocks) - never against a guess or the first sheet found,
+    unless there is genuinely only one to choose from."""
+    sheet_names = [
+        p.section
+        for p in db.query(DocumentPage).filter(DocumentPage.document_id == doc.id).order_by(DocumentPage.order_index).all()
+        if p.section
+    ]
+    if not sheet_names:
+        return None, {"error": f"« {doc.title} » ne contient aucune feuille indexée", "error_kind": "sheet_not_found"}
+
+    if sheet_name is None:
+        if len(sheet_names) == 1:
+            return sheet_names[0], None
+        return None, {
+            "error": (
+                f"« {doc.title} » contient plusieurs feuilles ({', '.join(sheet_names)}) - "
+                "précisez laquelle utiliser."
+            ),
+            "error_kind": "ambiguous_sheet",
+        }
+
+    normalized_target = normalize(sheet_name)
+    exact = [s for s in sheet_names if normalize(s) == normalized_target]
+    partial = [s for s in sheet_names if normalized_target in normalize(s)]
+    matches = exact or partial
+    if not matches:
+        return None, {
+            "error": (
+                f"feuille « {sheet_name} » introuvable dans « {doc.title} ». "
+                f"Feuilles disponibles : {', '.join(sheet_names)}"
+            ),
+            "error_kind": "sheet_not_found",
+        }
+    return matches[0], None
+
+
+def _load_sheet_rows(doc: Document, sheet_title: str) -> tuple[dict | None, dict | None]:
+    """Re-reads the ORIGINAL .xlsx from MinIO and parses it directly with
+    openpyxl - deliberately NOT the flattened RAG text (DocumentPage.text),
+    which stringifies every cell and loses the header/row structure a chart
+    needs. This is the one place in the codebase that re-parses uploaded
+    spreadsheet bytes at query time (see app/rag/extract.py's docstring,
+    which documents that the RAG pipeline never does)."""
+    ext = (doc.source_filename or "").rsplit(".", 1)[-1].lower() if doc.source_filename and "." in doc.source_filename else ""
+    if ext not in SPREADSHEET_EXTENSIONS:
+        return None, {"error": f"« {doc.title} » n'est pas un classeur Excel (.xlsx)", "error_kind": "not_spreadsheet"}
+    if not doc.minio_object_key:
+        return None, {"error": f"le fichier original de « {doc.title} » n'est plus disponible", "error_kind": "file_unavailable"}
+
+    try:
+        raw = download_file(doc.minio_object_key)
+    except Exception:  # noqa: BLE001 - MinIO down/unreachable, not a data problem
+        return None, {"error": "le service de fichiers est momentanément indisponible", "service_unavailable": True}
+
+    from io import BytesIO
+
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(BytesIO(raw), data_only=True, read_only=True)
+    worksheet = next((s for s in workbook.worksheets if s.title == sheet_title), None)
+    if worksheet is None:
+        return None, {"error": f"feuille « {sheet_title} » introuvable dans le fichier original", "error_kind": "sheet_not_found"}
+
+    all_rows = list(worksheet.iter_rows(values_only=True))
+    if not all_rows:
+        return None, {"error": f"la feuille « {sheet_title} » est vide", "error_kind": "empty_sheet"}
+
+    headers = [str(c).strip() if c is not None else "" for c in all_rows[0]]
+    rows: list[dict] = []
+    for raw_row in all_rows[1:]:
+        row = {h: v for h, v in zip(headers, raw_row) if h}
+        if any(v is not None for v in row.values()):
+            rows.append(row)
+
+    return {"headers": [h for h in headers if h], "rows": rows}, None
+
+
+def _read_spreadsheet_impl(
+    user_id: str, document_id: str | None, document_name: str | None, sheet_name: str | None
+) -> dict:
+    """Structured, ACL-scoped, never-approximated read of one sheet of an
+    internal .xlsx document - the priority data source for generate_chart
+    when a user names a specific file/sheet (see
+    app/agent/orchestrator.py::_run_chart_from_spreadsheet). Deliberately
+    the only tool that re-parses raw file bytes at query time - see
+    _load_sheet_rows. No caching anywhere in this path: every call re-opens
+    a fresh DB session and re-downloads/re-parses the file from MinIO, so
+    the dataset is always resolved fresh, never reused across turns."""
+    db = SessionLocal()
+    try:
+        user, grant = _load_user_and_grant(db, user_id)
+        decision = check_tool_access(grant=grant, tool_name="read_spreadsheet_data")
+        if not decision.allowed:
+            _audit(db, user=user, role=grant.role if grant else None, action="MCP_READ_SPREADSHEET", decision="DENY", reason=decision.reason)
+            return {"error": decision.reason, "error_kind": "policy_denied"}
+
+        if not document_id and not document_name:
+            return {"error": "précisez document_id ou document_name", "error_kind": "file_not_found"}
+
+        doc, err = _resolve_spreadsheet_document(db, grant, document_id, document_name)
+        if err is not None:
+            _audit(
+                db, user=user, role=grant.role, action="MCP_READ_SPREADSHEET",
+                decision="ALLOW" if "choices" in err else "DENY", reason=err.get("error", "ambiguous document name"),
+                extra={"document_name": document_name},
+            )
+            return err
+
+        if doc is None:
+            _audit(db, user=user, role=grant.role, action="MCP_READ_SPREADSHEET", decision="DENY", reason="document not found")
+            return {"error": DOCUMENT_NOT_FOUND_OR_DENIED, "error_kind": "file_not_found"}
+
+        access_decision = check_document_access(grant=grant, department=doc.department, confidentiality=doc.confidentiality)
+        if not access_decision.allowed:
+            _audit(
+                db, user=user, role=grant.role, action="MCP_READ_SPREADSHEET", decision="DENY",
+                resource_type="document", resource_id=str(doc.id), reason=access_decision.reason,
+            )
+            create_alert(
+                alert_type="DOCUMENT_ACCESS_DENIED",
+                user_id=user.id, username=user.username, role=user.role,
+                title=f"Tentative d'accès refusée dans l'assistant IA ({user.full_name})",
+                description=(
+                    f"Document visé (lecture de tableur) : « {doc.title} » ({doc.department}/{doc.confidentiality})\n"
+                    f"Refus : {access_decision.reason}"
+                ),
+                resource_type="document", resource_id=str(doc.id),
+            )
+            return {"error": DOCUMENT_NOT_FOUND_OR_DENIED, "error_kind": "file_not_found"}
+
+        resolved_sheet, err = _resolve_spreadsheet_sheet(db, doc, sheet_name)
+        if err is not None:
+            _audit(
+                db, user=user, role=grant.role, action="MCP_READ_SPREADSHEET", decision="ALLOW", reason="sheet not resolved",
+                resource_type="document", resource_id=str(doc.id), extra={"sheet_name": sheet_name},
+            )
+            return err
+
+        sheet_data, err = _load_sheet_rows(doc, resolved_sheet)
+        if err is not None:
+            _audit(
+                db, user=user, role=grant.role, action="MCP_READ_SPREADSHEET",
+                decision="ALLOW" if err.get("service_unavailable") else "DENY",
+                resource_type="document", resource_id=str(doc.id), reason=err.get("error"),
+            )
+            return err
+
+        _audit(
+            db, user=user, role=grant.role, action="MCP_READ_SPREADSHEET", decision="ALLOW", reason="ok",
+            resource_type="document", resource_id=str(doc.id),
+            extra={"title": doc.title, "sheet": resolved_sheet, "row_count": len(sheet_data["rows"])},
+        )
+        return {
+            "document_id": str(doc.id),
+            "title": doc.title,
+            "source_filename": doc.source_filename,
+            "department": doc.department,
+            "confidentiality": doc.confidentiality,
+            "sheet": resolved_sheet,
+            "columns": sheet_data["headers"],
+            "rows": sheet_data["rows"],
+            "row_count": len(sheet_data["rows"]),
+        }
+    finally:
+        db.close()
+
+
+def _generate_chart_impl(
+    user_id: str,
+    chart_type: str,
+    title: str,
+    category_field: str | None,
+    category_label: str | None,
+    value_fields: list[dict],
+    data: list[dict],
+    sources: list[dict] | None,
+) -> dict:
+    """Validates and echoes back an already-built chart spec - it never
+    fetches data itself. The caller (app/agent/orchestrator.py's
+    _run_generate_chart) is responsible for having sourced `data` from an
+    ACL-checked tool (search_database) or from data the user typed
+    themselves in the current message; this tool's only job is a final
+    structural check (app/agent/chart.py::validate_chart_spec) plus an
+    audit entry, so every chart that reaches the frontend went through the
+    same audited checkpoint as every other tool result."""
+    db = SessionLocal()
+    try:
+        user, grant = _load_user_and_grant(db, user_id)
+        decision = check_tool_access(grant=grant, tool_name="generate_chart")
+        if not decision.allowed:
+            _audit(db, user=user, role=grant.role if grant else None, action="MCP_GENERATE_CHART", decision="DENY", reason=decision.reason)
+            return {"error": decision.reason}
+
+        try:
+            validate_chart_spec(
+                chart_type=chart_type, title=title, category_field=category_field, value_fields=value_fields, data=data
+            )
+        except ChartValidationError as exc:
+            _audit(
+                db, user=user, role=grant.role, action="MCP_GENERATE_CHART", decision="ALLOW", reason="ok",
+                extra={"chart_type": chart_type, "title": title, "validation_error": str(exc)},
+            )
+            return {"error": str(exc)}
+
+        _audit(
+            db, user=user, role=grant.role, action="MCP_GENERATE_CHART", decision="ALLOW", reason="ok",
+            extra={"chart_type": chart_type, "title": title, "row_count": len(data)},
+        )
+        return {
+            "chart": {
+                "chart_type": chart_type,
+                "title": title,
+                "category_field": category_field,
+                "category_label": category_label,
+                "value_fields": value_fields,
+                "data": data,
+                "sources": sources or [],
+            }
+        }
+    finally:
+        db.close()
+
+
 # --- MCP tool declarations (schemas exposed to the LLM have no identity field) ---
 
 
@@ -757,6 +1035,66 @@ async def get_document_section(
         return {"error": str(exc)}
     return await anyio.to_thread.run_sync(
         _get_document_section_impl, identity.user_id, document_id, document_name, page, section, offset
+    )
+
+
+@mcp_app.tool()
+async def read_spreadsheet_data(
+    ctx: Context,
+    document_id: str | None = None,
+    document_name: str | None = None,
+    sheet_name: str | None = None,
+) -> dict:
+    """Read the exact structured rows/columns of one sheet of an internal
+    Excel (.xlsx) document the caller is authorized to see - returns the
+    real column headers and typed cell values read directly from the
+    original file, never a summary or an approximation. Identify the
+    document with `document_id` or `document_name` (matches the title or
+    the original filename, e.g. "Orbitia_Test_Entreprise_Complet.xlsx");
+    identify the sheet with `sheet_name` (matches the sheet's real name,
+    e.g. "CA mensuel"). Use this - never search_database - whenever the
+    user names a specific file or sheet; a nonexistent file/sheet is an
+    error, never a silent fallback to another data source."""
+    try:
+        identity = extract_identity(ctx)
+    except IdentityError as exc:
+        return {"error": str(exc)}
+    return await anyio.to_thread.run_sync(_read_spreadsheet_impl, identity.user_id, document_id, document_name, sheet_name)
+
+
+@mcp_app.tool()
+async def generate_chart(
+    ctx: Context,
+    chart_type: str,
+    title: str,
+    value_fields: list[dict],
+    data: list[dict],
+    category_field: str | None = None,
+    category_label: str | None = None,
+    sources: list[dict] | None = None,
+) -> dict:
+    """Validates a chart specification already built from verified data
+    (search_database results or data the user typed in this message) and
+    returns it for the frontend to render - never fetches or invents data
+    itself. `chart_type` is one of line/bar/scatter (category_field
+    required) or pie (category_field required, exactly one value_field) or
+    scatter (category_field must be omitted, exactly two value_fields: x
+    then y). A missing data point must be omitted or null, never 0 or a
+    guessed value."""
+    try:
+        identity = extract_identity(ctx)
+    except IdentityError as exc:
+        return {"error": str(exc)}
+    return await anyio.to_thread.run_sync(
+        _generate_chart_impl,
+        identity.user_id,
+        chart_type,
+        title,
+        category_field,
+        category_label,
+        value_fields,
+        data,
+        sources,
     )
 
 

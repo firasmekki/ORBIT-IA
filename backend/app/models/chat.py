@@ -40,6 +40,13 @@ class Message(Base):
     # exposed to the frontend - internal continuity only. Its "kind" is one
     # of "keyword_search" | "document_choice" | "document_section".
     reference_context: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Chart spec for this turn, if any (app/agent/chart.py's ChartSpec,
+    # dict-encoded) - unlike reference_context, this IS exposed to the
+    # frontend (see schemas/chat.py's MessageOut) and rendered by
+    # frontend/src/components/ChartBlock.tsx. Only ever built from data a
+    # tool already fetched under ACL (search_database) or that the user
+    # typed themselves in this same message - never invented.
+    chart: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")

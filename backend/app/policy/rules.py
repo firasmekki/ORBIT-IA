@@ -39,6 +39,8 @@ ALL_TOOLS: frozenset[str] = frozenset(
         "search_keyword",
         "list_documents",
         "get_document_section",
+        "generate_chart",
+        "read_spreadsheet_data",
     }
 )
 
@@ -49,6 +51,16 @@ _BASE_TOOLS = {
     "search_keyword",
     "list_documents",
     "get_document_section",
+    # Available to every role: generate_chart never fetches data itself
+    # (see app/agent/chart.py) - the actual ACL enforcement happens
+    # upstream, at whichever data-source tool (read_spreadsheet_data,
+    # search_database [DIRECTOR/ACCOUNTANT only]) or user-supplied input
+    # produced the numbers it's asked to render.
+    "generate_chart",
+    # Same department/confidentiality check as get_document_section (it's
+    # just another way of reading an authorized document's content) - no
+    # extra role restriction on top.
+    "read_spreadsheet_data",
 }
 
 # role -> MCP tools it is even allowed to invoke. A tool absent from a
