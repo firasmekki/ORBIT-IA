@@ -3,11 +3,25 @@ name: orbitia
 # Everything below models the "private network" boundary from the
 # architecture note: only `frontend` (the reverse proxy) and `backend`
 # publish a port to the host, and even those are bound to 127.0.0.1. The
-# MCP server, the LLM, the vector database and the document store are only
-# reachable from other containers on this compose network - never from the
-# host's network interface, let alone the Internet.
+# MCP server, vector database and document store are reachable only from
+# other containers. Native llama-server uses port 8096 with an API key.
 
 services:
+  searxng:
+    image: ${SEARXNG_IMAGE:-searxng/searxng:latest}
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Set a random SEARXNG_SECRET in .env}
+      SEARXNG_LIMITER: "false"
+      SEARXNG_PUBLIC_INSTANCE: "false"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
   postgres:
     image: pgvector/pgvector:pg16
     environment:
@@ -38,8 +52,8 @@ services:
       # session warm throughout; raise further or use -1 (never unload) if
       # VRAM headroom allows and the machine is dedicated to this.
       OLLAMA_KEEP_ALIVE: "30m"
-    # GPU inference instead of CPU-only - the single biggest lever on raw
-    # generation speed with a local model. Falls back to CPU automatically
+    # Embeddings only (nomic-embed-text, for the RAG index) - the chat model
+    # is the `llm` service. GPU instead of CPU-only. Falls back to CPU automatically
     # if no compatible GPU/driver is present (Ollama detects at runtime);
     # remove this block entirely on a machine with no NVIDIA GPU if it
     # fails to start.
@@ -51,15 +65,10 @@ services:
               count: all
               capabilities: [gpu]
 
-  # One-shot: pulls the small local chat + embedding models used by the
-  # demo, then exits. `backend`/`mcp` don't hard-depend on it finishing -
-  # the app runs fine without it, it just answers "LLM indisponible" until
-  # the models are present (see app/agent/llm_client.py's error handling).
-  # Also sends one throwaway prompt to the chat model so it's already
-  # loaded into VRAM (not just downloaded to disk) before the first real
-  # user message arrives - that first message is what used to eat the full
-  # ~60-90s cold-load penalty. The embedding model gets warmed for free
-  # right after, as a side effect of `seed` embedding the demo documents.
+  # One-shot: pulls the embedding model used by the RAG index
+  # (nomic-embed-text), then exits. Ollama now serves embeddings only; Qwen3
+  # generation runs in the native llama-server process. `seed` waits for this
+  # to finish before indexing documents.
   ollama-init:
     image: ollama/ollama:latest
     depends_on:
@@ -71,30 +80,51 @@ services:
       - >
         echo waiting for ollama...;
         until ollama list >/dev/null 2>&1; do sleep 2; done;
-        echo pulling chat model...;
-        ollama pull llama3.2:1b;
         echo pulling embedding model...;
         ollama pull nomic-embed-text;
-        echo warming chat model into VRAM...;
-        ollama run llama3.2:1b "hi" >/dev/null 2>&1 || true;
         echo done.
 
-  minio:
-    image: quay.io/minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-orbitia}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-orbitia123}
+  # S3-compatible object storage for the raw uploaded files. SeaweedFS
+  # (Apache-2.0) stands in for MinIO: MinIO withdrew its community images
+  # (pulling quay.io/minio/minio now fails with "unauthorized"), and the
+  # only one still published - quay.io/minio/aistor/minio - answers its own
+  # health endpoint while refusing every actual S3 call with "No license is
+  # installed", so the stack came up green and only uploads failed. The S3
+  # API is the same, so the backend's minio-py client and the MINIO_*
+  # settings below are unchanged.
+  objectstore:
+    image: chrislusf/seaweedfs:latest
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        cat > /tmp/s3.json <<JSON
+        {"identities":[{"name":"${MINIO_ROOT_USER:-orbitia}",
+         "credentials":[{"accessKey":"${MINIO_ROOT_USER:-orbitia}",
+                         "secretKey":"${MINIO_ROOT_PASSWORD:-orbitia123}"}],
+         "actions":["Admin","Read","Write","List","Tagging"]}]}
+        JSON
+        exec weed server -dir=/data -ip=objectstore -s3 -s3.port=9000 -s3.config=/tmp/s3.json
     volumes:
-      - orbitia_minio_data:/data
+      - orbitia_objectstore_data:/data
     ports:
+      # S3 API, plus the filer UI on 8888 for eyeballing what was stored.
       - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:8888:8888"
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      # Two checks, because `weed server` starting is not the same as its S3
+      # gateway serving: the master must report a cluster, and port 9000 must
+      # answer. 127.0.0.1 rather than `localhost` on purpose - busybox resolves
+      # that to ::1 and the listeners are IPv4-only. No -f on the S3 probe:
+      # an unauthenticated GET / correctly returns 403, which means it is up.
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:9333/cluster/status >/dev/null && curl -sS -o /dev/null http://127.0.0.1:9000"
+        ]
       interval: 5s
       timeout: 5s
       retries: 20
+      start_period: 10s
 
   # The real MCP server. No `ports:` entry on purpose - it is reachable
   # only as `mcp:8090` from inside this compose network.
@@ -119,15 +149,44 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-only-jwt-secret-change-me}
       INTERNAL_AUTH_SECRET: ${INTERNAL_AUTH_SECRET:-dev-only-internal-secret-change-me}
       MCP_SERVER_URL: "http://mcp:8090/mcp"
-      # Points at the bundled `ollama` container by default. If you already
-      # run Ollama natively on the host, override to
-      # http://host.docker.internal:11434 instead (see README) - either
-      # way the model stays on this machine, inside the private network.
+      # Chat/generation: Qwen3 from the native llama-server. Its API key is
+      # shared through the ignored .env file and never sent to the frontend.
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8096}
+      LLM_MODEL_NAME: "Qwen3-30B-A3B-Instruct-2507"
+      LLM_DISPLAY_NAME: "Qwen3-30B-A3B-Instruct-2507 (Q4_K_M)"
+      LLM_CONTEXT_SIZE: ${LLM_CONTEXT_SIZE:-4096}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-768}
+      VISION_ENABLED: ${VISION_ENABLED:-false}
+      VISION_BASE_URL: ${VISION_BASE_URL:-http://host.docker.internal:8097}
+      VISION_MODEL_NAME: ${VISION_MODEL_NAME:-qwen3-vl-8b}
+      VISION_DISPLAY_NAME: ${VISION_DISPLAY_NAME:-Qwen3-VL-8B-Instruct (Q4_K_M)}
+      VISION_TIMEOUT_SECONDS: ${VISION_TIMEOUT_SECONDS:-180}
+      VISION_MAX_IMAGE_BYTES: ${VISION_MAX_IMAGE_BYTES:-8388608}
+      # Same .env values start-orbit-ai.ps1 gives llama-server (display only).
+      LLM_SLEEP_IDLE_SECONDS: ${LLM_SLEEP_IDLE_SECONDS:--1}
+      VISION_SLEEP_IDLE_SECONDS: ${VISION_SLEEP_IDLE_SECONDS:-300}
+      # Web search (off by default; see .env.example "Recherche Web").
+      # Settings can also be changed in Admin > Recherche Web.
+      WEB_SEARCH_ENABLED: ${WEB_SEARCH_ENABLED:-false}
+      WEB_SEARCH_PROVIDER: ${WEB_SEARCH_PROVIDER:-brave}
+      SEARXNG_URL: ${SEARXNG_URL:-http://searxng:8080}
+      WEB_SEARCH_TRIGGER: ${WEB_SEARCH_TRIGGER:-auto}
+      WEB_SEARCH_MAX_RESULTS: ${WEB_SEARCH_MAX_RESULTS:-5}
+      WEB_SEARCH_FETCH_PAGES: ${WEB_SEARCH_FETCH_PAGES:-3}
+      WEB_SEARCH_TIMEOUT_SECONDS: ${WEB_SEARCH_TIMEOUT_SECONDS:-10}
+      WEB_SEARCH_LANGUAGE: ${WEB_SEARCH_LANGUAGE:-fr}
+      WEB_SEARCH_COUNTRY: ${WEB_SEARCH_COUNTRY:-}
+      WEB_SEARCH_CACHE_TTL_SECONDS: ${WEB_SEARCH_CACHE_TTL_SECONDS:-3600}
+      WEB_SEARCH_MAX_PER_HOUR: ${WEB_SEARCH_MAX_PER_HOUR:-60}
+      BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+      GOOGLE_SEARCH_API_KEY: ${GOOGLE_SEARCH_API_KEY:-}
+      GOOGLE_SEARCH_ENGINE_ID: ${GOOGLE_SEARCH_ENGINE_ID:-}
+      # Embeddings for the RAG index only: the bundled `ollama` container.
       OLLAMA_BASE_URL: "http://ollama:11434"
-      OLLAMA_CHAT_MODEL: "llama3.2:1b"
       OLLAMA_EMBEDDING_MODEL: "nomic-embed-text"
       EMBEDDING_DIM: "768"
-      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ENDPOINT: "objectstore:9000"
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-orbitia}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-orbitia123}
       # Comma-separated origins allowed to call the API directly with an
@@ -150,24 +209,47 @@ services:
 
   backend:
     build: ./backend
-    environment: *backend-env
+    environment:
+      <<: *backend-env
+      LLM_API_KEY: ${LLM_API_KEY:?Set LLM_API_KEY in .env; start-orbit-ai.ps1 generates one if needed}
+      # Server folder sources (app/services/source_roots.py): display paths
+      # of the folders mounted at /sources/1..3 below. Empty = slot unused.
+      SOURCE_ROOT_1_HOST: ${ORBIT_SOURCE_ROOT_1:-}
+      SOURCE_ROOT_2_HOST: ${ORBIT_SOURCE_ROOT_2:-}
+      SOURCE_ROOT_3_HOST: ${ORBIT_SOURCE_ROOT_3:-}
+      SOURCE_SCAN_INTERVAL_SECONDS: ${SOURCE_SCAN_INTERVAL_SECONDS:-600}
+      # Gmail OAuth credentials are backend-only.
+      GMAIL_OAUTH_CLIENT_ID: ${GMAIL_OAUTH_CLIENT_ID:-}
+      GMAIL_OAUTH_CLIENT_SECRET: ${GMAIL_OAUTH_CLIENT_SECRET:-}
+      GMAIL_OAUTH_REDIRECT_URI: ${GMAIL_OAUTH_REDIRECT_URI:-http://localhost:8081/api/connectivity/gmail/callback}
+      GMAIL_TOKEN_ENCRYPTION_KEY: ${GMAIL_TOKEN_ENCRYPTION_KEY:-}
+      GMAIL_FRONTEND_REDIRECT_URI: ${GMAIL_FRONTEND_REDIRECT_URI:-http://localhost:8081/connectivity}
     # Folder auto-import (see app/rag/watcher.py). Host path defaults to a
     # project-local folder (created automatically, gitignored) - point
     # WATCH_FOLDER_HOST_PATH in .env at a real folder and set
     # WATCH_FOLDER_ENABLED=true to turn it on. Harmless if left disabled:
     # the mount exists but nothing reads it.
+    #
+    # /sources/1..3: up to three folders of this PC that the Director may
+    # connect from the app (any sub-folder of them, switchable at will).
+    # Set ORBIT_SOURCE_ROOT_1=C:\Users\ORBIT\Desktop (etc.) in .env ONCE;
+    # READ-ONLY - the app can never modify or delete a file there. An unused
+    # slot mounts the empty project folder and is hidden from the app.
     volumes:
       - ${WATCH_FOLDER_HOST_PATH:-./watched-documents}:/data/watch
       - ./backups:/backups
+      - ${ORBIT_SOURCE_ROOT_1:-./watched-documents}:/sources/1:ro
+      - ${ORBIT_SOURCE_ROOT_2:-./watched-documents}:/sources/2:ro
+      - ${ORBIT_SOURCE_ROOT_3:-./watched-documents}:/sources/3:ro
     depends_on:
       postgres:
         condition: service_healthy
       mcp:
         condition: service_started
-      minio:
+      objectstore:
         condition: service_healthy
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8095:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
       interval: 5s
@@ -221,4 +303,4 @@ services:
 volumes:
   orbitia_postgres_data:
   orbitia_ollama_data:
-  orbitia_minio_data:
+  orbitia_objectstore_data:

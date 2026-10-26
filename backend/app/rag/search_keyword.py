@@ -69,3 +69,34 @@ def find_matches(text: str, line_offset: int, pattern: re.Pattern[str]) -> list[
             KeywordMatch(line=line_offset + local_line - 1, excerpt=text[excerpt_start:excerpt_end])
         )
     return matches
+
+
+# --- case-sensitive variant (search_document_text) -------------------------------
+#
+# The default matcher above folds case and accents on both sides (the
+# normalized text), which is what "Firas" vs "FIRAS" vs "firas" needs. A
+# case-sensitive search must instead match the ORIGINAL text, unfolded.
+
+
+def build_exact_pattern(query: str, *, whole_word: bool) -> re.Pattern[str] | None:
+    """Case-sensitive, accent-sensitive pattern over the original text.
+    Word boundaries are lookarounds rather than \b so a term that starts or
+    ends with a non-word character ("C++", "R&D") still matches whole."""
+    query = query.strip()
+    if not query:
+        return None
+    escaped = re.escape(query)
+    return re.compile(rf"(?<!\w){escaped}(?!\w)" if whole_word else escaped, re.UNICODE)
+
+
+def find_raw_matches(text: str, line_offset: int, pattern: re.Pattern[str]) -> list[KeywordMatch]:
+    """Same contract as find_matches, on the original (unnormalized) text."""
+    matches: list[KeywordMatch] = []
+    for m in pattern.finditer(text):
+        if m.start() == m.end():
+            continue
+        excerpt_start = max(0, m.start() - EXCERPT_RADIUS)
+        excerpt_end = min(len(text), m.end() + EXCERPT_RADIUS)
+        local_line = text.count("\n", 0, m.start()) + 1
+        matches.append(KeywordMatch(line=line_offset + local_line - 1, excerpt=text[excerpt_start:excerpt_end]))
+    return matches

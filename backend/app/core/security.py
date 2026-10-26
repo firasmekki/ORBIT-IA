@@ -59,13 +59,26 @@ def decode_access_token(token: str) -> dict[str, Any]:
     return payload
 
 
-def mint_internal_token(*, user_id: str, role: str, departments: list[str], max_level: str) -> str:
+def mint_internal_token(
+    *,
+    user_id: str,
+    role: str,
+    departments: list[str],
+    max_level: str,
+    workspace_id: str | None = None,
+    folder_scope: list[str] | None = None,
+    folder_depth: str = "recursive",
+) -> str:
     """Signed, short-lived, server-minted identity for MCP tool calls.
 
     departments/max_level are the *resolved* permission grant at mint time,
     not something the caller can widen later - the MCP server trusts the
     signature, not the values, but the values themselves are computed by
     the policy engine, never passed through from user/LLM input.
+
+    workspace_id is the workspace the backend already verified this user
+    may use for this turn (app/policy/workspace.py) - signed, so neither
+    the LLM nor the frontend can swap it; the MCP server re-checks it.
     """
     now = int(time.time())
     payload = {
@@ -73,6 +86,12 @@ def mint_internal_token(*, user_id: str, role: str, departments: list[str], max_
         "role": role,
         "departments": departments,
         "max_level": max_level,
+        "workspace_id": workspace_id,
+        # Sub-folders of that workspace chosen for this turn (validated by
+        # routers/chat.py) - only narrows what the tools may return.
+        "folder_scope": folder_scope or [],
+        # "direct": only the documents directly in those folders, no sub-folder.
+        "folder_depth": "direct" if folder_depth == "direct" else "recursive",
         "iat": now,
         "exp": now + settings.internal_auth_expire_seconds,
         "jti": str(uuid.uuid4()),

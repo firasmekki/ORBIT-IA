@@ -3,34 +3,31 @@ import {
   deleteConversation,
   deleteHistory,
   getConversation,
+  getLlmStatus,
+  getVisionStatus,
   listConversations,
-  resumeChatMessage,
   sendChatMessage,
 } from '../api/endpoints'
 import { ApiError } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 import { ConfidentialityBadge, DecisionBadge } from '../components/Badges'
 import { ChartBlock } from '../components/ChartBlock'
+import { SearchResultsBlock } from '../components/SearchResultsBlock'
 import { IconTrash } from '../components/Icons'
 import { WorkspacePicker } from '../components/WorkspacePicker'
-import {
-  clearWorkspaceHandle,
-  ensureReadPermission,
-  loadWorkspaceHandle,
-  readWorkspaceFile,
-  saveWorkspaceHandle,
-  walkWorkspace,
-} from '../lib/localFs'
+import { FolderScopePicker } from '../components/FolderScopePicker'
+import { loadScope, saveScope } from '../lib/folderScope'
+import { loadScopeMode, saveScopeMode } from '../lib/folderTree'
+import { fetchLabel, safeHttpUrl, splitSources } from '../lib/webSearch'
+import { LLM_STATUS_CLASS, answerModeLabel } from '../lib/answerMode'
+import { MarkdownMessage } from '../components/MarkdownMessage'
+import { ChatWelcome } from '../components/ChatWelcome'
+import { CHAT_INPUT_PLACEHOLDER } from '../lib/chatWelcome'
+import { looksLikeReport } from '../lib/markdown'
+import { FOLDER_POLL_MS, useWorkspaceContext } from '../context/WorkspaceContext'
+import { isWorkspaceSupported, pickWorkspaceDirectory } from '../lib/localFs'
 import { toolLabel } from '../lib/tools'
-import type { ConversationSummary, LocalFileEntry, MessageOut, PendingClientAction } from '../types'
-
-const SUGGESTIONS: Record<string, string[]> = {
-  DIRECTOR: ['Quel est le budget de la masse salariale 2025 ?', 'Résume le plan stratégique 2026.'],
-  HR: ['Trouve-moi la politique de congés.', 'Donne-moi le salaire des employés.'],
-  ACCOUNTANT: ['Quel est le budget IT 2025 ?', 'Montre-moi la grille des salaires individuels.'],
-  DEVELOPER: ["Quelle est l'architecture technique de la plateforme ?", "Donne-moi les accès à l'infrastructure de production."],
-  EMPLOYEE: ['Quelle est la politique de congés ?', 'Quel est le budget marketing 2025 ?'],
-}
+import type { ConversationSummary, LlmStatus, MessageOut, ScopeMode, VisionStatus } from '../types'
 
 function isDeniedMessage(msg: MessageOut): boolean {
   return msg.role === 'assistant' && msg.sources.length === 0 && msg.tool_trace.some((t) => t.decision === 'DENY')
@@ -42,39 +39,105 @@ export function ChatPage() {
   const [activeId, setActiveId] = useState<string | null>(null)
   const [messages, setMessages] = useState<MessageOut[]>([])
   const [input, setInput] = useState('')
+  const [imageFile, setImageFile] = useState<File | null>(null)
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null)
+  const imagePickerRef = useRef<HTMLInputElement>(null)
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [successMessage, setSuccessMessage] = useState<string | null>(null)
   const [showDeleteModal, setShowDeleteModal] = useState(false)
   const [conversationToDelete, setConversationToDelete] = useState<ConversationSummary | null>(null)
-  const [workspaceHandle, setWorkspaceHandle] = useState<FileSystemDirectoryHandle | null>(null)
-  const [workspaceIndex, setWorkspaceIndex] = useState<LocalFileEntry[]>([])
+  // The workspace this chat searches in (checked server-side on every
+  // message) and its connected folder, watched app-wide (WorkspaceContext).
+  const {
+    workspaces,
+    workspace,
+    workspaceId,
+    selectWorkspace,
+    refreshWorkspaces,
+    removeWorkspace,
+    folderName,
+    needsPermission,
+    syncState,
+    syncProgress,
+    syncReport,
+    lastSyncAt,
+    syncError,
+    connectFolder,
+    disconnectFolder,
+    reauthorizeFolder,
+    syncNow,
+  } = useWorkspaceContext()
   const [showWorkspacePicker, setShowWorkspacePicker] = useState(false)
+  const [exportingId, setExportingId] = useState<string | null>(null)
+  // Sub-folders the assistant searches in ("BIC"), remembered per workspace.
+  const [folderScope, setFolderScope] = useState<string[]>([])
+  useEffect(() => setFolderScope(loadScope(workspaceId)), [workspaceId])
+  function changeScope(scope: string[]) {
+    setFolderScope(scope)
+    if (workspaceId) saveScope(workspaceId, scope)
+  }
+  // How deep: those folders only, with sub-folders (default), or every workspace.
+  const [scopeMode, setScopeMode] = useState<ScopeMode>('recursive')
+  useEffect(() => setScopeMode(loadScopeMode(workspaceId)), [workspaceId])
+  function changeScopeMode(mode: ScopeMode) {
+    setScopeMode(mode)
+    if (workspaceId) saveScopeMode(workspaceId, mode)
+  }
+  const [ignoredReasonFilter, setIgnoredReasonFilter] = useState('all')
+  const [ignoredDisplayLimit, setIgnoredDisplayLimit] = useState(100)
+  const [llmStatus, setLlmStatus] = useState<LlmStatus | null>(null)
+  const [visionStatus, setVisionStatus] = useState<VisionStatus | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    refreshConversations()
+    // The local model loads once, in its own container, independently of
+    // this page - poll its state (quickly while it loads, rarely once
+    // ready) so the user sees "Chargement du modèle IA..." / "prêt".
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    async function poll() {
+      try {
+        const status = await getLlmStatus()
+        if (cancelled) return
+        setLlmStatus(status)
+        timer = setTimeout(poll, status.status === 'ready' ? 30000 : 4000)
+      } catch {
+        if (!cancelled) timer = setTimeout(poll, 10000)
+      }
+    }
+    poll()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
   }, [])
 
   useEffect(() => {
-    // Restores the previously granted workspace, if any, on page reload -
-    // the browser may still silently honor the permission (same-origin,
-    // same session) or may require the user to re-confirm; either way we
-    // never re-prompt automatically without a user gesture.
-    ;(async () => {
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    async function pollVision() {
       try {
-        const handle = await loadWorkspaceHandle()
-        if (!handle) return
-        const granted = await ensureReadPermission(handle)
-        if (!granted) return
-        setWorkspaceHandle(handle)
-        const entries = await walkWorkspace(handle)
-        setWorkspaceIndex(entries)
+        const status = await getVisionStatus()
+        if (cancelled) return
+        setVisionStatus(status)
+        timer = setTimeout(pollVision, status.status === 'ready' ? 30000 : 5000)
       } catch {
-        // non-fatal - the user can just pick the workspace again
+        if (!cancelled) timer = setTimeout(pollVision, 10000)
       }
-    })()
+    }
+    void pollVision()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
   }, [])
+
+  useEffect(() => {
+    if (workspaceId) void refreshConversations(workspaceId)
+    // refreshConversations only depends on workspaceId
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceId])
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
@@ -86,9 +149,22 @@ export function ChatPage() {
     return () => clearTimeout(timer)
   }, [successMessage])
 
-  async function refreshConversations() {
+  const canSync = workspace?.can_sync ?? false
+
+  useEffect(() => {
+    if (!imageFile) {
+      setImagePreviewUrl(null)
+      return
+    }
+    const url = URL.createObjectURL(imageFile)
+    setImagePreviewUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [imageFile])
+
+  async function refreshConversations(id: string | null = workspaceId) {
+    if (!id) return
     try {
-      const list = await listConversations()
+      const list = await listConversations(id)
       setConversations(list)
     } catch {
       // non-fatal
@@ -132,94 +208,79 @@ export function ChatPage() {
     setSuccessMessage('Conversation supprimée avec succès.')
   }
 
-  async function handleWorkspacePicked(handle: FileSystemDirectoryHandle) {
-    setWorkspaceHandle(handle)
-    setShowWorkspacePicker(false)
+  function handleSelectWorkspace(id: string) {
+    if (id === workspaceId) return
+    // A conversation belongs to one workspace: switching starts a new one.
+    setActiveId(null)
+    setMessages([])
+    setConversations([])
+    setError(null)
+    selectWorkspace(id)
+  }
 
-    // Persisting the handle (so the workspace survives a page reload) is
-    // a separate concern from building this session's index - and must
-    // never block it. IndexedDB can legitimately fail (storage quota,
-    // private browsing restrictions) without that meaning the workspace
-    // itself is unusable right now.
+  async function handleConnectClick() {
     try {
-      await saveWorkspaceHandle(handle)
-    } catch {
-      // non-fatal: usable for this session, just won't auto-restore later
-    }
-
-    try {
-      const entries = await walkWorkspace(handle)
-      setWorkspaceIndex(entries)
+      const handle = await pickWorkspaceDirectory()
+      setConversations([])
+      setActiveId(null)
+      setMessages([])
+      await connectFolder(handle)
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Impossible de parcourir ce dossier.")
-    }
-  }
-
-  async function handleWorkspaceDisconnect() {
-    setWorkspaceHandle(null)
-    setWorkspaceIndex([])
-    setShowWorkspacePicker(false)
-    try {
-      await clearWorkspaceHandle()
-    } catch {
-      // non-fatal
-    }
-  }
-
-  /** Executes a pending_client_action the backend returned (it has no
-   * disk access - only this tab, holding the real handle, can actually
-   * read the file) and resumes the chat turn with the result. */
-  async function resolvePendingAction(conversationId: string, action: PendingClientAction) {
-    if (!workspaceHandle) {
-      setError("Le workspace n'est plus connecté.")
-      setSending(false)
-      return
-    }
-    try {
-      const { base64 } = await readWorkspaceFile(workspaceHandle, action.relative_path)
-      const response = await resumeChatMessage({
-        conversation_id: conversationId,
-        action_id: action.action_id,
-        relative_path: action.relative_path,
-        name: action.name,
-        content_base64: base64,
-      })
-      if (response.message) {
-        setMessages((prev) => [...prev, response.message as MessageOut])
+      if (!(err instanceof DOMException && err.name === 'AbortError')) {
+        setError(err instanceof Error ? err.message : "Impossible d'accéder à ce dossier.")
       }
-    } catch (err) {
-      const message =
-        err instanceof ApiError
-          ? err.message
-          : err instanceof Error
-            ? `Impossible de lire « ${action.name} » : ${err.message}`
-            : `Impossible de lire « ${action.name} ».`
-      setError(message)
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `error-${Date.now()}`,
-          role: 'assistant',
-          content: `Erreur : ${message}`,
-          sources: [],
-          tool_trace: [],
-          created_at: new Date().toISOString(),
-        },
-      ])
-    } finally {
-      setSending(false)
     }
+  }
+
+  async function handleFolderPicked(handle: FileSystemDirectoryHandle) {
+    setShowWorkspacePicker(false)
+    try {
+      await connectFolder(handle)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Impossible d'accéder à ce dossier.")
+    }
+  }
+
+  async function handleDisconnectFolder() {
+    setShowWorkspacePicker(false)
+    await disconnectFolder()
   }
 
   async function send(text: string) {
     const trimmed = text.trim()
-    if (!trimmed || sending) return
+    const selectedImage = imageFile
+    if ((!trimmed && !selectedImage) || sending) return
+    if (selectedImage && visionStatus?.status !== 'ready') {
+      setError('Le moteur vision n’est pas prêt. Réessayez lorsque son état sera « prêt ».')
+      return
+    }
+    if (selectedImage && (!['image/jpeg', 'image/png', 'image/webp'].includes(selectedImage.type) || selectedImage.size > 8 * 1024 * 1024)) {
+      setError('Choisissez une image JPEG, PNG ou WebP de 8 Mio maximum.')
+      return
+    }
     setError(null)
+
+    let imagePayload: { mime_type: string; data_base64: string } | undefined
+    if (selectedImage) {
+      try {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onerror = () => reject(new Error('Impossible de lire cette image.'))
+          reader.onload = () => resolve(String(reader.result))
+          reader.readAsDataURL(selectedImage)
+        })
+        imagePayload = { mime_type: selectedImage.type, data_base64: dataUrl.split(',', 2)[1] }
+      } catch {
+        setError('Impossible de lire cette image.')
+        return
+      }
+    }
+    const displayedText = trimmed || 'Analyse l’image jointe.'
 
     const optimisticUser: MessageOut = {
       id: `local-${Date.now()}`,
       role: 'user',
-      content: trimmed,
+      content: displayedText + (selectedImage ? ` [image : ${selectedImage.name}]` : ''),
       sources: [],
       tool_trace: [],
       created_at: new Date().toISOString(),
@@ -229,15 +290,16 @@ export function ChatPage() {
     setSending(true)
 
     try {
-      const response = await sendChatMessage(trimmed, activeId ?? undefined, workspaceIndex.length > 0 ? workspaceIndex : undefined)
+      const response = await sendChatMessage(
+        displayedText,
+        activeId ?? undefined,
+        workspaceId ?? undefined,
+        imagePayload,
+        folderScope,
+        scopeMode,
+      )
+      setImageFile(null)
       setActiveId(response.conversation_id)
-      if (response.pending_client_action) {
-        // Still "sending" - the backend asked for a local file's content,
-        // which only this tab can actually read (see resolvePendingAction).
-        await resolvePendingAction(response.conversation_id, response.pending_client_action)
-        refreshConversations()
-        return
-      }
       if (response.message) {
         setMessages((prev) => [...prev, response.message as MessageOut])
       }
@@ -258,6 +320,29 @@ export function ChatPage() {
       ])
     } finally {
       setSending(false)
+    }
+  }
+
+  async function exportPdf(msg: MessageOut, index: number) {
+    setExportingId(msg.id)
+    setError(null)
+    try {
+      // The request that produced this answer: the closest user message above it.
+      const question = [...messages.slice(0, index)].reverse().find((m) => m.role === 'user')?.content ?? null
+      const { downloadReportPdf } = await import('../lib/reportPdf')
+      const filename = await downloadReportPdf({
+        markdown: msg.content,
+        question,
+        workspace: workspace?.name ?? null,
+        scope: folderScope,
+        sources: msg.sources.map((s) => ({ title: s.title, relative_path: s.relative_path, excerpt: s.excerpt })),
+        generatedAt: new Date(),
+      })
+      setSuccessMessage(`PDF téléchargé : ${filename}`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "L'export PDF a échoué.")
+    } finally {
+      setExportingId(null)
     }
   }
 
@@ -322,55 +407,251 @@ export function ChatPage() {
         <div className="card chat-panel">
           <div className="chat-panel-header">
             <button type="button" className="workspace-button" onClick={() => setShowWorkspacePicker(true)}>
-              📁 Workspace : {workspaceHandle ? workspaceHandle.name : 'Aucun dossier'}
-              {workspaceHandle && (
-                <span className="workspace-status">
-                  <span className="workspace-dot active" /> Actif
+              {workspace?.source ? '🖥️' : '📁'} Workspace : {workspace?.name ?? '…'}
+            </button>
+            {workspaceId && (
+              <FolderScopePicker
+                workspaceId={workspaceId}
+                workspaceName={workspace?.name ?? ''}
+                value={folderScope}
+                mode={scopeMode}
+                onChange={changeScope}
+                onModeChange={changeScopeMode}
+              />
+            )}
+            <span className="workspace-sync-status" role="status">
+              {workspace?.source ? (
+                <span title={`${workspace.source.host_path}\nLu directement par ORBIT (lecture seule), en continu, même page fermée.`}>
+                  {!workspace.source.enabled
+                    ? '⏸ Synchronisation en pause'
+                    : workspace.source.status === 'scanning'
+                      ? `🟡 Analyse du dossier… ${workspace.source.scan_seen ?? 0} élément(s)`
+                      : workspace.source.status === 'missing' || workspace.source.status === 'error'
+                        ? `🔴 ${workspace.source.error ?? 'Dossier inaccessible'}`
+                        : '🟢 Dossier du PC · synchronisation auto'}
+                </span>
+              ) : syncState === 'syncing' ? (
+                <>
+                  🟡 Synchronisation…
+                  {syncProgress && syncProgress.total > 0 && (
+                    <>
+                      {' '}
+                      {syncProgress.phase === 'hashing' ? 'analyse' : 'envoi'} {syncProgress.done + 1}/{syncProgress.total}
+                    </>
+                  )}
+                </>
+              ) : needsPermission ? (
+                <button type="button" className="btn btn-primary" style={{ padding: '3px 10px', fontSize: 12 }} onClick={reauthorizeFolder}>
+                  🔓 Réactiver la synchronisation de « {folderName} »
+                </button>
+              ) : syncState === 'error' ? (
+                <span title={syncError ?? syncReport?.failed.map((f) => `${f.relative_path} : ${f.reason}`).join('\n')}>
+                  🔴 Synchronisation incomplète{syncReport ? ` (${syncReport.failed.length} échec(s))` : ''}
+                </span>
+              ) : folderName ? (
+                <span title={`Le dossier « ${folderName} » est vérifié toutes les ${FOLDER_POLL_MS / 1000} s : nouveaux fichiers et sous-dossiers ajoutés automatiquement.`}>
+                  🟢 {syncState === 'synced' ? 'Synchronisé' : 'Connecté'} · surveillance auto
+                  {lastSyncAt && <span className="workspace-count"> · {lastSyncAt.toLocaleTimeString('fr-FR')}</span>}
+                </span>
+              ) : (
+                <>
+                  {workspace?.folder_name && !workspace.is_default ? (
+                    <span title="Ce dossier a été synchronisé depuis un autre navigateur ou une autre adresse ; reconnectez-le ici pour reprendre la synchronisation automatique.">
+                      ⚠ Dossier « {workspace.folder_name} » non connecté sur ce navigateur
+                    </span>
+                  ) : (
+                    <span>⚪ Aucun dossier synchronisé</span>
+                  )}
+                  {isWorkspaceSupported() && (
+                    <button type="button" className="btn btn-primary" style={{ padding: '3px 10px', fontSize: 12 }} onClick={handleConnectClick}>
+                      📂 {workspace?.folder_name && !workspace.is_default ? 'Reconnecter' : 'Importer un petit dossier depuis le navigateur'}
+                    </button>
+                  )}
+                </>
+              )}
+              {syncReport && (
+                <span className="workspace-count" title="Résumé de la dernière synchronisation">
+                  Total : {syncReport.totalFiles} · indexables : {syncReport.localFiles} · ignorés : {syncReport.ignored.length} · erreurs réelles : {syncReport.failed.length}
                 </span>
               )}
-            </button>
+              {workspace && <span className="workspace-count">🔎 {workspace.document_count} indexé(s)</span>}
+              {workspace && workspace.pending_count > 0 && (
+                <span
+                  className="workspace-count"
+                  title="Fichiers déjà copiés dans ORBIT ; lecture du contenu (texte, OCR) puis recherche par le sens en arrière-plan."
+                >
+                  ⟳ {workspace.pending_count} en cours d'analyse
+                </span>
+              )}
+              {syncReport && (
+                <details className="workspace-ignored">
+                  <summary>Formats détectés</summary>
+                  <ul>
+                    {Object.entries(syncReport.formatCounts).sort(([a], [b]) => a.localeCompare(b)).map(([format, count]) => (
+                      <li key={format}>{format} : {count}</li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+              {syncReport && syncReport.ignored.length > 0 && (
+                <details className="workspace-ignored">
+                  <summary>Voir les fichiers ignorés ({syncReport.ignored.length})</summary>
+                  <div className="workspace-ignored-tools">
+                    <label>
+                      Filtrer par raison{' '}
+                      <select value={ignoredReasonFilter} onChange={(event) => setIgnoredReasonFilter(event.target.value)}>
+                        <option value="all">Toutes les raisons</option>
+                        {[...new Set(syncReport.ignored.map((file) => file.code))].map((code) => (
+                          <option key={code} value={code}>{code}</option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  <ul>
+                    {syncReport.ignored.filter((file) => ignoredReasonFilter === 'all' || file.code === ignoredReasonFilter).slice(0, ignoredDisplayLimit).map((file) => (
+                      <li key={`${file.relative_path}:${file.code}`}>
+                        <strong>{file.relative_path}</strong> — {file.reason}
+                      </li>
+                    ))}
+                  </ul>
+                  {syncReport.ignored.filter((file) => ignoredReasonFilter === 'all' || file.code === ignoredReasonFilter).length > ignoredDisplayLimit && (
+                    <button type="button" className="btn" onClick={() => setIgnoredDisplayLimit((limit) => limit + 100)}>
+                      Afficher 100 fichiers ignorés supplémentaires
+                    </button>
+                  )}
+                </details>
+              )}
+            </span>
+            {folderName && !needsPermission && canSync && syncState !== 'syncing' && (
+              <button type="button" className="btn" style={{ padding: '4px 10px', fontSize: 12 }} onClick={syncNow}>
+                ⟳ Synchroniser
+              </button>
+            )}
             <button type="button" className="btn" style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => setShowWorkspacePicker(true)}>
-              {workspaceHandle ? 'Changer' : 'Choisir un dossier'}
+              Changer
             </button>
+            {llmStatus && (
+              <span
+                className={`llm-status ${LLM_STATUS_CLASS[llmStatus.status] ?? 'llm-status-unavailable'}`}
+                title={llmStatus.detail ? `${llmStatus.model} — ${llmStatus.detail}` : llmStatus.model}
+                role="status"
+              >
+                <span className="llm-status-dot" />
+                {llmStatus.message}
+              </span>
+            )}
           </div>
           <div className="chat-messages" ref={scrollRef}>
-            {messages.length === 0 && (
-              <div className="chat-empty">
-                <h3>Posez une question à l'assistant</h3>
-                <p>
-                  L'agent recherche uniquement dans les documents et données auxquels votre rôle («
-                  {user?.role}») a accès. Toute tentative en dehors de ce périmètre est refusée par le
-                  serveur, pas par l'assistant lui-même.
-                </p>
-                {(SUGGESTIONS[user?.role ?? ''] ?? []).map((s) => (
-                  <button key={s} className="suggestion-chip" onClick={() => send(s)}>
-                    {s}
-                  </button>
-                ))}
-              </div>
-            )}
+            {messages.length === 0 && <ChatWelcome />}
 
-            {messages.map((msg) => (
+            {messages.map((msg, index) => (
               <div key={msg.id} className={`msg-row ${msg.role}${isDeniedMessage(msg) ? ' denied' : ''}`}>
                 <div className="msg-avatar">{msg.role === 'user' ? (user?.full_name[0] ?? 'U') : 'IA'}</div>
                 <div style={{ minWidth: 0 }}>
-                  <div className="msg-bubble">{msg.content}</div>
+                  {msg.role === 'assistant' ? (
+                    <div className={`msg-bubble msg-markdown${msg.answer_mode === 'unavailable' ? ' msg-unavailable' : ''}`}>
+                      <MarkdownMessage content={msg.content} />
+                      {answerModeLabel(msg.answer_mode) && (
+                        <div className={`answer-mode answer-mode-${msg.answer_mode}`}>{answerModeLabel(msg.answer_mode)}</div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="msg-bubble">{msg.content}</div>
+                  )}
 
-                  {msg.chart && <ChartBlock spec={msg.chart} />}
+                  {msg.role === 'assistant' && looksLikeReport(msg.content) && (
+                    <div className="msg-actions">
+                      <button
+                        type="button"
+                        className="btn"
+                        disabled={exportingId === msg.id}
+                        onClick={() => exportPdf(msg, index)}
+                        title="Télécharger cette réponse sous forme de fichier PDF (texte, titres, tableaux et sources)"
+                      >
+                        {exportingId === msg.id ? 'Génération du PDF…' : '⬇ Télécharger en PDF'}
+                      </button>
+                    </div>
+                  )}
+
+                  {msg.clarification && msg.clarification.options.length > 0 && (
+                    // Clicking an option sends it as the user's answer. Only
+                    // the latest question is still answerable.
+                    <div className="clarification-options" role="group" aria-label="Réponses proposées">
+                      {msg.clarification.options.map((option) => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          className="chip-button"
+                          disabled={sending || index !== messages.length - 1}
+                          onClick={() => send(option.value)}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {msg.chart && <ChartBlock spec={msg.chart} onAsk={sending ? undefined : (text) => send(text)} />}
+
+                  {msg.search_results && <SearchResultsBlock results={msg.search_results} />}
 
                   {(msg.sources.length > 0 || msg.tool_trace.length > 0) && (
                     <div className="msg-meta">
-                      {msg.sources.length > 0 && (
+                      {/* For an exact search the results panel already lists
+                          every source document - no duplicate list. */}
+                      {msg.sources.length > 0 && !msg.search_results && splitSources(msg.sources).local.length > 0 && (
                         <div className="sources-block">
-                          <div className="sources-title">Sources utilisées</div>
-                          {msg.sources.map((s) => (
-                            <div key={s.document_id} className="source-item">
+                          <div className="sources-title">Documents de l’espace de travail</div>
+                          {splitSources(msg.sources).local.map((s, i) => (
+                            <div key={s.document_id ?? `local-${i}`} className="source-item">
                               <div className="source-item-title">
-                                {s.title} <ConfidentialityBadge level={s.confidentiality} /> <span className="dept-tag">{s.department}</span>
+                                📄 {s.citation ? `[${s.citation}] ` : ''}
+                                {s.title} {s.confidentiality && <ConfidentialityBadge level={s.confidentiality} />}{' '}
+                                {s.department && <span className="dept-tag">{s.department}</span>}
                               </div>
+                              {s.relative_path && workspace && (
+                                <div className="source-item-path">
+                                  📁 {workspace.name}/{s.relative_path}
+                                  {s.page ? `, page ${s.page}` : ''}
+                                </div>
+                              )}
                               <div className="source-item-excerpt">{s.excerpt}</div>
                             </div>
                           ))}
+                        </div>
+                      )}
+
+                      {splitSources(msg.sources).web.length > 0 && (
+                        <div className="sources-block sources-web">
+                          <div className="sources-title">Sources Web</div>
+                          {splitSources(msg.sources).web.map((s, i) => {
+                            const href = safeHttpUrl(s.url)
+                            return (
+                              <div key={`web-${i}`} className="source-item">
+                                <div className="source-item-title">
+                                  🌐 {s.citation ? `[${s.citation}] ` : ''}
+                                  {href ? (
+                                    <a href={href} target="_blank" rel="noopener noreferrer">
+                                      {s.title}
+                                    </a>
+                                  ) : (
+                                    s.title
+                                  )}
+                                  <span className={`fetch-badge ${s.fetch_status === 'fetched' ? 'fetch-read' : 'fetch-snippet'}`}>
+                                    {fetchLabel(s)}
+                                  </span>
+                                </div>
+                                <div className="source-item-path">
+                                  {s.domain}
+                                  {s.published ? ` · publié : ${s.published.slice(0, 10)}` : ''}
+                                  {s.accessed_at ? ` · consulté le ${s.accessed_at.slice(0, 10)}` : ''}
+                                  {s.provider ? ` · via ${s.provider}` : ''}
+                                </div>
+                                {href && <div className="source-item-url mono">{href}</div>}
+                                <div className="source-item-excerpt">{s.excerpt}</div>
+                              </div>
+                            )
+                          })}
                         </div>
                       )}
 
@@ -382,6 +663,7 @@ export function ChatPage() {
                               <DecisionBadge decision={t.decision} />
                               <span>{toolLabel(t.tool)}</span>
                               {t.decision === 'DENY' && <span style={{ color: 'var(--deny)' }}>— {t.reason}</span>}
+                              {t.decision === 'ERROR' && <span style={{ color: 'var(--text-muted)' }}>— {t.reason}</span>}
                             </div>
                           ))}
                         </details>
@@ -418,15 +700,51 @@ export function ChatPage() {
           )}
 
           <div className="chat-composer">
+            {imageFile && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                {imagePreviewUrl && <img src={imagePreviewUrl} alt="Aperçu de l’image jointe" style={{ maxWidth: 96, maxHeight: 72, objectFit: 'contain', borderRadius: 4 }} />}
+                <span>Image jointe : {imageFile.name} ({(imageFile.size / 1024 / 1024).toFixed(1)} Mio)</span>
+                <button type="button" className="btn" onClick={() => setImageFile(null)} disabled={sending}>Retirer</button>
+              </div>
+            )}
             <textarea
               className="input"
-              placeholder="Posez votre question…"
+              placeholder={CHAT_INPUT_PLACEHOLDER}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               disabled={sending}
             />
-            <button className="btn btn-primary" onClick={() => send(input)} disabled={sending || !input.trim()}>
+            <input
+              ref={imagePickerRef}
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              hidden
+              onChange={(event) => {
+                const file = event.target.files?.[0] ?? null
+                if (file && (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 8 * 1024 * 1024)) {
+                  setError('Choisissez une image JPEG, PNG ou WebP de 8 Mio maximum.')
+                  event.target.value = ''
+                  return
+                }
+                setError(null)
+                setImageFile(file)
+              }}
+            />
+            <button
+              type="button"
+              className="btn"
+              onClick={() => imagePickerRef.current?.click()}
+              disabled={sending || visionStatus?.status !== 'ready'}
+              title={visionStatus?.status === 'ready' ? visionStatus.model : 'Le moteur vision est indisponible.'}
+            >
+              {visionStatus?.status === 'ready' ? 'Image' : visionStatus?.status === 'loading' ? 'Vision…' : 'Vision indisponible'}
+            </button>
+            <button
+              className="btn btn-primary"
+              onClick={() => send(input)}
+              disabled={sending || (!input.trim() && !imageFile) || Boolean(imageFile && visionStatus?.status !== 'ready')}
+            >
               Envoyer
             </button>
           </div>
@@ -451,10 +769,19 @@ export function ChatPage() {
 
       {showWorkspacePicker && (
         <WorkspacePicker
-          currentWorkspaceName={workspaceHandle?.name ?? null}
+          workspaces={workspaces}
+          currentId={workspaceId}
+          connectedFolder={folderName}
+          onSelect={handleSelectWorkspace}
+          onCreated={async (created) => {
+            await refreshWorkspaces()
+            handleSelectWorkspace(created.id)
+          }}
+          onFolderPicked={handleFolderPicked}
+          onDisconnectFolder={handleDisconnectFolder}
+          onWorkspaceChanged={() => void refreshWorkspaces()}
+          onDeleteWorkspace={removeWorkspace}
           onClose={() => setShowWorkspacePicker(false)}
-          onPicked={handleWorkspacePicked}
-          onDisconnect={handleWorkspaceDisconnect}
         />
       )}
     </div>

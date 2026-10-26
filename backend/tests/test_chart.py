@@ -1,6 +1,12 @@
 import pytest
 
-from app.agent.chart import ChartValidationError, parse_inline_data, summarize_chart, validate_chart_spec
+from app.agent.chart import (
+    ChartValidationError,
+    order_by_calendar_month,
+    parse_inline_data,
+    summarize_chart,
+    validate_chart_spec,
+)
 
 
 # --- parse_inline_data -----------------------------------------------------
@@ -125,3 +131,38 @@ def test_summarize_never_invents_missing_values():
     }
     text = summarize_chart(spec)
     assert "Aucune valeur" in text
+
+
+# --- order_by_calendar_month -------------------------------------------------
+
+_MONTHS = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+
+
+def test_months_are_put_in_calendar_order_never_alphabetical():
+    shuffled = [{"Mois": m, "CA": i} for i, m in enumerate(sorted(_MONTHS))]  # alphabetical: Août, Avril, ...
+    ordered = order_by_calendar_month(shuffled, "Mois")
+    assert [r["Mois"] for r in ordered] == _MONTHS
+    # Same rows, values untouched - only their order changed.
+    assert sorted(ordered, key=lambda r: r["CA"]) == shuffled
+
+
+def test_twelve_months_already_ordered_are_left_as_is():
+    rows = [{"Mois": m, "CA": 1000 + i} for i, m in enumerate(_MONTHS)]
+    assert order_by_calendar_month(rows, "Mois") == rows
+
+
+def test_abbreviations_and_missing_accents_are_recognised():
+    rows = [{"m": "Déc."}, {"m": "janv"}, {"m": "Fevrier"}, {"m": "SEPT"}]
+    assert [r["m"] for r in order_by_calendar_month(rows, "m")] == ["janv", "Fevrier", "SEPT", "Déc."]
+
+
+def test_non_month_categories_keep_their_source_order():
+    rows = [{"x": "Produit B"}, {"x": "Produit A"}]
+    assert order_by_calendar_month(rows, "x") == rows
+    mixed = [{"x": "Mars"}, {"x": "Total"}, {"x": "Janvier"}]
+    assert order_by_calendar_month(mixed, "x") == mixed
+
+
+def test_repeated_months_are_never_reordered_or_merged():
+    rows = [{"x": "Janvier"}, {"x": "Février"}, {"x": "Janvier"}]
+    assert order_by_calendar_month(rows, "x") == rows

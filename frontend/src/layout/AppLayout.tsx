@@ -11,6 +11,7 @@ import {
   IconDocument,
   IconLogout,
   IconMenu,
+  IconPlug,
   IconSearch,
   IconSettings,
   IconShield,
@@ -23,6 +24,7 @@ const NAV_ITEMS = [
   { to: '/', label: 'Tableau de bord', icon: IconDashboard },
   { to: '/chat', label: 'Assistant IA', icon: IconChat },
   { to: '/documents', label: 'Documents', icon: IconDocument },
+  { to: '/connectivity', label: 'Connectivité', icon: IconPlug },
 ]
 
 const DIRECTOR_ITEMS = [

@@ -1,0 +1,19 @@
+﻿use_default_settings: true
+
+search:
+  formats:
+    - html
+    - json
+
+server:
+  # Placeholder only - never the effective secret. SEARXNG_SECRET (required by
+  # docker-compose.yml, a random value kept in the local .env) overrides it.
+  # SearXNG refuses to start if this sentinel is left in place without that
+  # variable, so a missing secret fails closed.
+  secret_key: "ultrasecretkey"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+# Un service strictement interne au réseau Compose; SearXNG agrège les moteurs
+# disponibles selon leur configuration par défaut et leurs conditions d'accès.

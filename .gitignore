@@ -32,3 +32,13 @@ Thumbs.db
 # Local data (never commit real documents or DB dumps)
 /backups/
 /watched-documents/
+
+# Local LLM weights and runtime (tens of GB): the model as downloaded, and
+# everything local-models/ builds from it (GGUF, llama.cpp binaries, logs,
+# scripts). Never in git.
+/models qi/
+/local-models/
+
+# Local hand-made backups of scripts/config (e.g. start-orbit-ai.ps1.bak-20261009)
+*.bak
+*.bak-*

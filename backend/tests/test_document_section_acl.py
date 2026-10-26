@@ -6,6 +6,7 @@ database."""
 import uuid
 
 import app.mcp.server as mcp_server
+from app.policy.engine import ACCESS_DENIED, NOT_FOUND, classify_tool_result, public_tool_result
 
 
 def test_authorized_read_by_page(make_doc, make_test_user):
@@ -91,8 +92,15 @@ def test_nonexistent_and_unauthorized_return_identical_response(make_doc, make_t
     nonexistent_result = mcp_server._get_document_section_impl(str(employee.id), str(uuid.uuid4()), None, 1, None, 0)
     unauthorized_result = mcp_server._get_document_section_impl(str(employee.id), str(doc.id), None, 1, None, 0)
 
-    assert nonexistent_result == unauthorized_result
-    assert nonexistent_result == {"error": mcp_server.DOCUMENT_NOT_FOUND_OR_DENIED}
+    # What the user (chat trace) and the LLM can see is byte-for-byte the
+    # same - no existence oracle...
+    assert public_tool_result(nonexistent_result) == public_tool_result(unauthorized_result)
+    assert public_tool_result(nonexistent_result) == {"error": mcp_server.DOCUMENT_NOT_FOUND_OR_DENIED}
+    assert classify_tool_result(nonexistent_result)[0] == classify_tool_result(unauthorized_result)[0] == "ERROR"
+    # ...while the internal code still tells them apart, so only the real
+    # refusal can raise a security alert.
+    assert nonexistent_result["code"] == NOT_FOUND
+    assert unauthorized_result["code"] == ACCESS_DENIED
 
 
 def test_alert_only_fires_for_genuinely_existing_unauthorized_document(make_doc, make_test_user, db):
@@ -198,7 +206,7 @@ def test_title_resolution_no_match_among_authorized_returns_identical_message(ma
     employee = make_test_user(username="emp_sec10", role="EMPLOYEE")
 
     result = mcp_server._get_document_section_impl(str(employee.id), None, "Grille des salaires confidentielle", 1, None, 0)
-    assert result == {"error": mcp_server.DOCUMENT_NOT_FOUND_OR_DENIED}
+    assert public_tool_result(result) == {"error": mcp_server.DOCUMENT_NOT_FOUND_OR_DENIED}
 
 
 def test_title_resolution_only_searches_authorized_documents(make_doc, make_test_user):
@@ -230,4 +238,4 @@ def test_access_revoked_between_turns_is_denied_on_reopen(make_doc, make_test_us
     db.commit()
 
     second = mcp_server._get_document_section_impl(str(accountant.id), str(doc.id), None, 1, None, 0)
-    assert second == {"error": mcp_server.DOCUMENT_NOT_FOUND_OR_DENIED}
+    assert public_tool_result(second) == {"error": mcp_server.DOCUMENT_NOT_FOUND_OR_DENIED}

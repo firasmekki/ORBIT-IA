@@ -161,6 +161,23 @@ export function IconLock(props: IconProps) {
   )
 }
 
+export function IconPlug(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M8 7v5m8-5v5M6 12h12v2a6 6 0 0 1-6 6h0a6 6 0 0 1-6-6v-2ZM10 3v4m4-4v4M12 20v1" />
+    </svg>
+  )
+}
+
+export function IconMail(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <rect x="3.5" y="5" width="17" height="14" rx="2" />
+      <path d="m4.5 7 7.5 6 7.5-6" />
+    </svg>
+  )
+}
+
 export function IconSparkle(props: IconProps) {
   return (
     <svg {...base(props)}>

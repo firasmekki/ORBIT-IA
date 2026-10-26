@@ -11,7 +11,7 @@ from app.rag.ingest import ingest_document
 
 
 def _patch_embed(monkeypatch):
-    monkeypatch.setattr("app.rag.ingest.embed_text", lambda text: [0.0] * 768)
+    monkeypatch.setattr("app.rag.ingest.embed_texts", lambda texts: [[0.0] * 768 for _ in texts])
 
 
 def test_chunk_linked_to_correct_single_page(db, monkeypatch):
@@ -156,11 +156,11 @@ def test_chunk_text_and_embeddings_unaffected_by_page_linking(db, monkeypatch):
     - only adds metadata alongside the existing chunk_text/embedding."""
     calls = []
 
-    def fake_embed(text):
-        calls.append(text)
-        return [0.1] * 768
+    def fake_embed(texts):
+        calls.extend(texts)
+        return [[0.1] * 768 for _ in texts]
 
-    monkeypatch.setattr("app.rag.ingest.embed_text", fake_embed)
+    monkeypatch.setattr("app.rag.ingest.embed_texts", fake_embed)
 
     doc = Document(
         title="Doc", department="GENERAL", confidentiality="INTERNAL",

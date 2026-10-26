@@ -65,8 +65,18 @@ async function getBlob(path: string): Promise<{ blob: Blob; filename: string | n
     throw new ApiError(response.status, detail)
   }
   const disposition = response.headers.get('Content-Disposition') || ''
-  const match = /filename="?([^"]+)"?/.exec(disposition)
-  return { blob: await response.blob(), filename: match ? match[1] : null }
+  // RFC 5987 UTF-8 name first ("Capture d'écran.png"), plain ASCII fallback otherwise.
+  const utf8 = /filename\*=UTF-8''([^;]+)/i.exec(disposition)
+  const plain = /filename="?([^";]+)"?/.exec(disposition)
+  let filename: string | null = plain ? plain[1] : null
+  if (utf8) {
+    try {
+      filename = decodeURIComponent(utf8[1])
+    } catch {
+      // keep the ASCII fallback
+    }
+  }
+  return { blob: await response.blob(), filename }
 }
 
 export const api = {

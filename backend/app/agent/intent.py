@@ -85,6 +85,11 @@ _EXTRACTORS = [
         re.IGNORECASE,
     ),
     re.compile(rf"où\s+(?:est-ce\s+que\s+)?(?:apparaît|apparait|se trouve)\s+[\"']?{_PHRASE}[\"']?", re.IGNORECASE),
+    # "combien de fois apparaît (le mot) Mekki ?" - verb before the term
+    re.compile(
+        rf"combien\s+de\s+fois\s+(?:appara[iî]t|figure|revient)\s+(?:le\s+(?:mot|terme|nom)\s+)?[\"']?{_PHRASE}[\"']?",
+        re.IGNORECASE,
+    ),
     # Single-word only below (_WORD, not _PHRASE): these aren't anchored on
     # the left the way the ones above are (nothing has to precede the
     # capture group), so a multi-word cap would greedily swallow whatever
@@ -122,10 +127,172 @@ def detect_keyword_intent(message: str) -> KeywordIntent | None:
     return None
 
 
+# --- free-text search intent ("recherche Tarek", "Tarek", "où est Firas") ----
+#
+# A request to FIND a term - a person's name, an identifier, a reference, an
+# email - must run a real exact search (search_keyword, ACL-scoped in SQL),
+# never be left to the vector search + LLM: embeddings carry no reliable
+# signal for a rare proper noun, and the model would then confidently answer
+# "aucune mention" without anything having been searched. Detected here,
+# deterministically, so the search runs whatever the model would have done.
+
+
+@dataclass(frozen=True)
+class SearchIntent:
+    term: str
+    # "workspace": the user named their local Workspace; "documents": the
+    # company documents; "all": unspecified - every source they may read.
+    scope: str = "all"
+
+
+_SEARCH_VERB = r"(?:re)?cherch(?:e|er|ez|es)|trouv(?:e|er|ez|es)|localis(?:e|er|ez)|rep[eè]re[rz]?"
+_POLITE_PREFIX = r"(?:(?:est-ce\s+que\s+)?(?:tu\s+)?(?:peux|pourrais|pouvez|pourriez)[-\s](?:tu|vous)?\s*|merci\s+de\s+|svp\s+|stp\s+)?"
+_SCOPE_WORKSPACE_RE = re.compile(
+    r"\s*\b(?:(?:au\s+niveau\s+(?:du|de\s+l[ae']?|de)|dans|sur|parmi)\s+(?:le\s+|mon\s+|l[ae']\s*|les\s+|mes\s+)?)?"
+    r"(?:workspace|espace\s+de\s+travail|dossier\s+local|fichiers?\s+locaux|mes\s+fichiers)\b",
+    re.IGNORECASE,
+)
+_SCOPE_DOCUMENTS_RE = re.compile(
+    r"\s*\b(?:dans|parmi|sur)\s+(?:les|mes|nos|tous\s+les)\s+(?:documents?|fichiers?|donn[ée]es)(?:\s+(?:accessibles|internes|de\s+l'entreprise))?\b",
+    re.IGNORECASE,
+)
+_SEARCH_PATTERNS = [
+    # "compte le mot Mekki", "nombre d'occurrences de Mekki"
+    re.compile(
+        r"^(?:compte[rz]?|d[ée]nombre[rz]?)\s+(?:les\s+occurrences\s+d[eu]\s+|le\s+(?:mot|terme|nom)\s+)?(?P<term>.+)$"
+        r"|^(?:le\s+)?nombre\s+d['’]\s*occurrences?\s+(?:d[eu]\s+|des?\s+)?(?P<term2>.+)$",
+        re.IGNORECASE,
+    ),
+    # "recherche Tarek", "peux-tu chercher Firas Mekki", "trouve-moi le nom Tarek"
+    re.compile(
+        rf"^{_POLITE_PREFIX}(?:{_SEARCH_VERB})(?:[-\s]+moi)?\s+(?:(?:le\s+nom|la\s+personne|le\s+mot|le\s+terme|l'occurrence|les\s+occurrences)\b)?\s*(?:de\s+|d')?(?P<term>.+)$",
+        re.IGNORECASE,
+    ),
+    # "où apparaît Tarek ?", "où est Firas", "où se trouve INV-2025-001"
+    re.compile(r"^où\s+(?:est|apparaît|apparait|se\s+trouve|figure|est\s+mentionn[ée]e?)\s+(?P<term>.+)$", re.IGNORECASE),
+    # "mention de Tarek", "les mentions de Firas"
+    re.compile(r"^(?:les\s+)?mentions?\s+(?:de|du|d')\s*(?P<term>.+)$", re.IGNORECASE),
+    # "donne-moi les documents qui mentionnent Tarek", "documents contenant Firas"
+    re.compile(
+        r"(?:documents?|fichiers?)\s+(?:qui\s+)?(?:mentionn\w*|contien\w*|contenant|cit\w*|parl\w*\s+(?:de|d'))\s*(?P<term>.+)$",
+        re.IGNORECASE,
+    ),
+]
+# "qui est Tarek ?" is a lookup only for a proper name (capitalised) -
+# "qui est le directeur ?" is a question for the documents, not a search.
+_WHO_IS_RE = re.compile(r"^qui\s+est\s+(?P<term>[A-ZÀ-Ý][\wÀ-ÿ\-]*(?:\s+[A-ZÀ-Ý][\wÀ-ÿ\-]*){0,2})\s*\??$")
+_LEADING_ARTICLES_RE = re.compile(r"^(?:(?:les|le|la|une|un|des|du|de)\s+|l'|d')", re.IGNORECASE)
+# Where a search term ends: the start of a trailing clause ("Tarek dans les
+# documents", "Firas pour le projet"). Narrower than _TRAILING_STOPWORDS on
+# purpose - "de"/"la" belong INSIDE names and titles ("Politique de
+# congés", "Tarek Ben Ali").
+_TERM_END_WORDS = {"dans", "sur", "pour", "avec", "sans", "qui", "que", "parmi", "stp", "svp", "dis-moi", "montre-moi"}
+# A whole message made of 1-3 such tokens ("Tarek", "Firas Mekki",
+# "INV-2025-001", "x@orbitia.tn") is a lookup.
+_BARE_TOKEN_RE = re.compile(r"^[\wÀ-ÿ@.\-+']+$")
+# Words that are never a search term on their own: greetings, acknowledgements,
+# conversation control, and nouns that name a kind of thing rather than a term.
+_NOT_A_TERM = {
+    "bonjour", "bonsoir", "salut", "hello", "hi", "coucou", "merci", "ok", "okay", "oui", "non", "d'accord",
+    "daccord", "parfait", "super", "top", "bien", "test", "aide", "help", "quoi", "pourquoi", "comment",
+    "suite", "continue", "stop", "annuler", "autre", "encore", "voila", "voilà", "exact", "exactement",
+    "document", "documents", "fichier", "fichiers", "graphique", "courbe", "tableau", "workspace",
+}
+
+
+# "combien de mot Mekki", "combien de fois le mot Mekki", "le nombre
+# d'occurrences du terme X": the counting words are not part of the term.
+_COUNT_PREFIX_RE = re.compile(
+    r"^(?:combien\s+(?:de\s+|d['’]\s*)?(?:fois|mots?|occurrences?)|(?:le\s+)?nombre\s+d['’e]\s*(?:fois|occurrences?|mots?))"
+    r"\s*(?:(?:du|de|des|le|la|les|d['’])\s*)?(?:(?:mots?|termes?|noms?)\s+)?",
+    re.IGNORECASE,
+)
+_TERM_PREFIX_RE = re.compile(r"^(?:(?:le|du|les|des)\s+)?(?:mots?|termes?|noms?)\s+", re.IGNORECASE)
+# "... Mekki apparaît / figure / revient / est présent ..." - the verb ends the term.
+_TERM_END_VERB_RE = re.compile(
+    r"\s+(?:appara[iî]t|appara[iî]ssent|figure|figurent|revient|reviennent|existe|est\s+pr[ée]sent\w*|est\s+mentionn\w*)\b.*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_term(raw: str) -> str:
+    term = _SCOPE_WORKSPACE_RE.sub(" ", raw)
+    term = _SCOPE_DOCUMENTS_RE.sub(" ", term)
+    term = term.strip(_STRIP_CHARS + " ")
+    quoted = _QUOTED.search(term)
+    if quoted:
+        return quoted.group(1).strip(_STRIP_CHARS)
+    term = _COUNT_PREFIX_RE.sub("", term)
+    term = _TERM_PREFIX_RE.sub("", term)
+    term = _TERM_END_VERB_RE.sub("", term)
+    term = _LEADING_ARTICLES_RE.sub("", term)
+    kept: list[str] = []
+    for word in term.split():
+        if word.strip(_STRIP_CHARS).lower() in _TERM_END_WORDS:
+            break
+        kept.append(word)
+    return " ".join(kept).strip(_STRIP_CHARS + " ")
+
+
+def _is_term(term: str) -> bool:
+    words = term.split()
+    if not words or len(words) > 4 or len(term) > 60:
+        return False
+    return normalize(words[0]) not in {normalize(w) for w in _NOT_A_TERM}
+
+
+def detect_search_intent(message: str, *, allow_bare: bool = True) -> SearchIntent | None:
+    """`allow_bare=False` while another dialog expects a short answer (a
+    pending chart question: "Infrastructure" there is an answer, not a
+    lookup)."""
+    text = message.strip()
+    if not text:
+        return None
+    scope = (
+        "workspace"
+        if _SCOPE_WORKSPACE_RE.search(text)
+        else "documents"
+        if _SCOPE_DOCUMENTS_RE.search(text)
+        else "all"
+    )
+
+    quoted = _QUOTED.search(text)
+    for pattern in [*_SEARCH_PATTERNS, _WHO_IS_RE]:
+        match = pattern.search(text)
+        if match:
+            raw_term = match.groupdict().get("term") or match.groupdict().get("term2") or ""
+            term = quoted.group(1).strip(_STRIP_CHARS) if quoted else _clean_term(raw_term)
+            return SearchIntent(term=term, scope=scope) if _is_term(term) else None
+
+    if allow_bare and "?" not in text:
+        tokens = _clean_term(text).split()
+        normalized_tokens = {normalize(t) for t in tokens}
+        if (
+            1 <= len(tokens) <= 3
+            and all(_BARE_TOKEN_RE.match(t) for t in tokens)
+            and not normalized_tokens & _BARE_EXCLUDED
+            and not all(t.lower() in _TRAILING_STOPWORDS for t in tokens)
+        ):
+            return SearchIntent(term=" ".join(tokens), scope=scope)
+    return None
+
+
+# A bare message containing any of these is a command or a chat turn, not a
+# term to look up ("liste les documents", "résume ça", "lis rapport.pdf").
+_BARE_EXCLUDED = {normalize(w) for w in _NOT_A_TERM} | {
+    "liste", "lister", "listes", "montre", "affiche", "resume", "resumer", "explique", "expliquer", "donne",
+    "ouvre", "ouvrir", "lis", "lire", "analyse", "analyser", "compare", "comparer", "fais", "genere", "cree",
+    "quel", "quelle", "quels", "quelles", "combien", "est", "sont", "suis", "moi", "toi", "ca", "cela", "ceci",
+}
+
+
 # --- list_documents intent -------------------------------------------------
 
 _LIST_TRIGGER = re.compile(
-    r"\b(?:liste|listes?|montre(?:-moi)?|affiche(?:-moi)?|quels?\s+sont)\b.*\bdocuments?\b", re.IGNORECASE
+    r"\b(?:liste|listes?|montre(?:-moi)?|affiche(?:-moi)?|quels?\s+sont)\b.*\b(?:documents?|fichiers?)\b"
+    # "Quels fichiers sont disponibles ?", "quels documents ai-je ?"
+    r"|\bquel(?:le)?s?\s+(?:sont\s+les\s+)?(?:fichiers?|documents?)\b",
+    re.IGNORECASE,
 )
 
 # Normalized (accent/case-folded via app.rag.normalize) French synonym ->
@@ -364,8 +531,13 @@ class SpreadsheetReference:
 
 
 def detect_spreadsheet_reference(message: str) -> SpreadsheetReference | None:
-    file_match = _FILE_HINT_RE.search(message)
-    sheet_match = _SHEET_HINT_RE.search(message)
+    # Last mention wins: in a multi-turn chart dialog the message is the
+    # whole conversation so far, and a later answer ("feuille CA mensuel")
+    # corrects an earlier one.
+    file_matches = list(_FILE_HINT_RE.finditer(message))
+    sheet_matches = list(_SHEET_HINT_RE.finditer(message))
+    file_match = file_matches[-1] if file_matches else None
+    sheet_match = sheet_matches[-1] if sheet_matches else None
     file_hint = file_match.group(1) if file_match else None
     sheet_hint = sheet_match.group(1).strip(_STRIP_CHARS + " ") if sheet_match else None
     if not file_hint and not sheet_hint:
@@ -383,8 +555,17 @@ _CHART_TYPE_WORDS: dict[str, tuple[str, ...]] = {
     "bar": ("histogramme", "barres", "classement", "bar chart"),
 }
 
+_SOFT_CHART_WORDS = frozenset(
+    {"évolution", "tendance", "répartition", "proportion", "parts de", "classement", "corrélation", "relation entre"}
+)
+_VISUAL_VERB_RE = re.compile(
+    r"\b(?:affiche|afficher|montre|montrer|trace|tracer|dessine|dessiner|visualis\w*|repr[ée]sente\w*)\b", re.IGNORECASE
+)
+
 _GENERIC_CHART_TRIGGER = re.compile(r"\b(?:graphique|diagramme|visualis[eé]r?|visualisation)\b", re.IGNORECASE)
-_CHART_VERB_RE = re.compile(r"\b(?:affiche|montre|fais|g[ée]n[èe]re|cr[ée]e[rz]?)\b", re.IGNORECASE)
+_CHART_VERB_RE = re.compile(
+    r"\b(?:affiche|montre|fais|g[ée]n[èe]re|cr[ée]e[rz]?|donne|trace|dessine|veux|voudrais|souhaite)\b", re.IGNORECASE
+)
 # "compare" alone is ambiguous with a future compare_documents tool (not
 # built yet) - only counted as a chart signal when the subject is clearly
 # numeric/data, not "compare ces deux documents".
@@ -392,7 +573,7 @@ _CHART_DATA_NOUNS_RE = re.compile(
     r"\b(?:ventes?|budgets?|d[ée]penses?|revenus?|chiffre d'affaires|produits?|d[ée]partements?|co[uû]ts?)\b",
     re.IGNORECASE,
 )
-_COMPARE_RE = re.compile(r"\bcompar[eèz]\w*\b", re.IGNORECASE)
+_COMPARE_RE = re.compile(r"\bcompar\w*\b", re.IGNORECASE)  # compare, comparer, comparant, comparaison...
 # Wider than _CHART_VERB_RE: an explicit file/sheet reference (see
 # detect_spreadsheet_reference above) already carries most of the intent
 # signal on its own, so a softer action verb - "compare"/"utilise" as well
@@ -422,9 +603,22 @@ def detect_chart_intent(message: str) -> ChartIntent | None:
 
     matched_type = None
     for chart_type, words in _CHART_TYPE_WORDS.items():
-        if any(w in lowered for w in words):
-            matched_type = chart_type
-            break
+        matched = [w for w in words if w in lowered]
+        if not matched:
+            continue
+        # "évolution", "tendance", "répartition"... are ordinary words too
+        # ("les dernières évolutions de la réglementation" is not a chart
+        # request): they mean a chart only with a visual verb ("affiche",
+        # "montre", "trace"...), or an action verb about chiffred data
+        # ("je veux l'évolution du budget"). "courbe", "histogramme",
+        # "camembert"... are charts on their own.
+        if all(w in _SOFT_CHART_WORDS for w in matched) and not (
+            _VISUAL_VERB_RE.search(message)
+            or (_CHART_VERB_RE.search(message) and _CHART_DATA_NOUNS_RE.search(message))
+        ):
+            continue
+        matched_type = chart_type
+        break
 
     has_generic = bool(_GENERIC_CHART_TRIGGER.search(message))
     # "visualise"/"visualiser" already carries its own imperative - doesn't

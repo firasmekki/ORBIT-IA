@@ -14,6 +14,10 @@ class Conversation(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="Nouvelle conversation")
+    # The workspace this conversation searches in - fixed at creation, so a
+    # conversation can never drift into another workspace. NULL (older
+    # conversations) means the default workspace.
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # Soft delete only - see routers/chat.py's delete_history. The row (and
     # its messages) are kept for traceability, never hard-deleted; every
@@ -53,6 +57,17 @@ class Message(Base):
     # tool already fetched under ACL (search_database) or that the user
     # typed themselves in this same message - never invented.
     chart: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # A structured question back to the user, when the agent needs more
+    # information before it can answer (see Clarification.to_dict() in
+    # app/agent/chart_dialog.py) - rendered by the frontend as clickable
+    # options. NULL for every ordinary answer.
+    clarification: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Exact search result (term, total, per-document occurrences with their
+    # location and excerpt) - rendered by the frontend as a results panel.
+    # NULL for every other answer.
+    search_results: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # direct | general | documents | web | hybrid | unavailable (NULL: older rows)
+    answer_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")

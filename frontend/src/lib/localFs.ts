@@ -7,15 +7,11 @@
 // sent to the backend - see app/agent/local_files.py's docstring for the
 // matching backend-side half of this contract.
 import type { LocalFileEntry } from '../types'
+import { isIgnoredDirectory } from './workspaceSyncPolicy.js'
 
 const DB_NAME = 'orbitia-workspace'
 const STORE_NAME = 'handles'
 const HANDLE_KEY = 'active'
-
-// Guards against a pathological selection (e.g. the user's whole home
-// folder) making the index-build hang the tab - matches this feature's
-// own test plan ("1000+ fichiers").
-const MAX_WORKSPACE_FILES = 5000
 
 export function isWorkspaceSupported(): boolean {
   return typeof window !== 'undefined' && typeof window.showDirectoryPicker === 'function'
@@ -28,6 +24,15 @@ export async function pickWorkspaceDirectory(): Promise<FileSystemDirectoryHandl
     )
   }
   return window.showDirectoryPicker({ mode: 'read' })
+}
+
+/** Without prompting: is read access still granted (e.g. after a reload)? */
+export async function hasReadPermission(handle: FileSystemDirectoryHandle): Promise<boolean> {
+  try {
+    return (await handle.queryPermission({ mode: 'read' })) === 'granted'
+  } catch {
+    return false
+  }
 }
 
 export async function ensureReadPermission(handle: FileSystemDirectoryHandle): Promise<boolean> {
@@ -48,12 +53,17 @@ function openDb(): Promise<IDBDatabase> {
   })
 }
 
-export async function saveWorkspaceHandle(handle: FileSystemDirectoryHandle): Promise<void> {
+/** One remembered folder per workspace: key = `ws:<workspace id>`. */
+export function workspaceHandleKey(workspaceId: string): string {
+  return `ws:${workspaceId}`
+}
+
+export async function saveWorkspaceHandle(handle: FileSystemDirectoryHandle, key: string = HANDLE_KEY): Promise<void> {
   const db = await openDb()
   try {
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite')
-      tx.objectStore(STORE_NAME).put(handle, HANDLE_KEY)
+      tx.objectStore(STORE_NAME).put(handle, key)
       tx.oncomplete = () => resolve()
       tx.onerror = () => reject(tx.error)
     })
@@ -62,12 +72,12 @@ export async function saveWorkspaceHandle(handle: FileSystemDirectoryHandle): Pr
   }
 }
 
-export async function loadWorkspaceHandle(): Promise<FileSystemDirectoryHandle | null> {
+export async function loadWorkspaceHandle(key: string = HANDLE_KEY): Promise<FileSystemDirectoryHandle | null> {
   const db = await openDb()
   try {
     return await new Promise<FileSystemDirectoryHandle | null>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readonly')
-      const req = tx.objectStore(STORE_NAME).get(HANDLE_KEY)
+      const req = tx.objectStore(STORE_NAME).get(key)
       req.onsuccess = () => resolve((req.result as FileSystemDirectoryHandle | undefined) ?? null)
       req.onerror = () => reject(req.error)
     })
@@ -76,12 +86,12 @@ export async function loadWorkspaceHandle(): Promise<FileSystemDirectoryHandle |
   }
 }
 
-export async function clearWorkspaceHandle(): Promise<void> {
+export async function clearWorkspaceHandle(key: string = HANDLE_KEY): Promise<void> {
   const db = await openDb()
   try {
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, 'readwrite')
-      tx.objectStore(STORE_NAME).delete(HANDLE_KEY)
+      tx.objectStore(STORE_NAME).delete(key)
       tx.oncomplete = () => resolve()
       tx.onerror = () => reject(tx.error)
     })
@@ -90,51 +100,72 @@ export async function clearWorkspaceHandle(): Promise<void> {
   }
 }
 
-/** Recursively walks every sub-folder of `root`, building metadata-only
- * entries - no file content is ever read here. A file that can't be
- * opened (permission/lock) is still indexed by name; size/date are left
- * unknown rather than guessed. */
-export async function walkWorkspace(root: FileSystemDirectoryHandle): Promise<LocalFileEntry[]> {
-  const entries: LocalFileEntry[] = []
-
-  async function walk(dir: FileSystemDirectoryHandle, relativePrefix: string, parentFolder: string | null) {
+/** Streams every file entry recursively. Only one metadata record is held
+ * by the traversal at a time; file bytes are never read. */
+export async function* scanWorkspace(root: FileSystemDirectoryHandle): AsyncGenerator<LocalFileEntry> {
+  async function* walk(
+    dir: FileSystemDirectoryHandle,
+    relativePrefix: string,
+    parentFolder: string | null,
+    excludedDirectory: string | null,
+  ): AsyncGenerator<LocalFileEntry> {
     for await (const [name, handle] of dir.entries()) {
-      if (entries.length >= MAX_WORKSPACE_FILES) return
       const relativePath = relativePrefix ? `${relativePrefix}/${name}` : name
       if (handle.kind === 'directory') {
-        await walk(handle as FileSystemDirectoryHandle, relativePath, relativePath)
+        const excluded = excludedDirectory ?? (isIgnoredDirectory(name) ? relativePath : null)
+        yield* walk(handle as FileSystemDirectoryHandle, relativePath, relativePath, excluded)
       } else {
         const fileHandle = handle as FileSystemFileHandle
+        const dotIndex = name.lastIndexOf('.')
+        const extension = dotIndex > 0 ? name.slice(dotIndex + 1).toLowerCase() : ''
         let size = 0
+        let sizeKnown = false
         let modifiedAt: string | null = null
         try {
           const file = await fileHandle.getFile()
           size = file.size
+          sizeKnown = true
           modifiedAt = new Date(file.lastModified).toISOString()
         } catch {
           // unreadable right now - keep the entry, just without size/date
         }
-        const dotIndex = name.lastIndexOf('.')
-        const extension = dotIndex > 0 ? name.slice(dotIndex + 1).toLowerCase() : ''
-        entries.push({
+        yield {
           name,
           relative_path: relativePath,
           extension,
           size,
           modified_at: modifiedAt,
           parent_folder: parentFolder,
-        })
+          excluded_directory: excludedDirectory,
+          size_known: sizeKnown,
+        }
       }
     }
   }
 
-  await walk(root, '', null)
+  yield* walk(root, '', null, null)
+}
+
+/** Compatibility helper for callers that need a materialized list. */
+export async function walkWorkspace(root: FileSystemDirectoryHandle): Promise<LocalFileEntry[]> {
+  const entries: LocalFileEntry[] = []
+  for await (const entry of scanWorkspace(root)) entries.push(entry)
   return entries
 }
 
 /** Reads one file's bytes by its relative path within `root` - called
  * only when the agent has explicitly asked for this exact file (see
  * ChatPage.tsx's pending_client_action handling), never eagerly. */
+/** The File at `relativePath` (lazy - no bytes read until asked). */
+export async function getWorkspaceFile(root: FileSystemDirectoryHandle, relativePath: string): Promise<File> {
+  const segments = relativePath.split('/').filter(Boolean)
+  let dir = root
+  for (let i = 0; i < segments.length - 1; i++) {
+    dir = await dir.getDirectoryHandle(segments[i])
+  }
+  return (await dir.getFileHandle(segments[segments.length - 1])).getFile()
+}
+
 export async function readWorkspaceFile(
   root: FileSystemDirectoryHandle,
   relativePath: string,

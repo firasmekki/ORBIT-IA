@@ -21,6 +21,7 @@ from sqlalchemy.engine import Connection, Engine
 
 from app.core.config import Settings
 from app.core.database import Base
+from app.models.workspace import DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME
 
 logger = logging.getLogger("orbitia.migrations")
 
@@ -32,6 +33,50 @@ def bootstrap_schema(conn: Connection) -> None:
     Base.metadata.create_all(bind=conn)
 
     conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)"))
+
+    # Workspaces (app/models/workspace.py). Every existing document lands in
+    # the default workspace through the column DEFAULT - nothing is moved,
+    # rewritten or deleted.
+    conn.execute(
+        text(
+            "INSERT INTO workspaces (id, name, owner_id, default_department, default_confidentiality, created_at) "
+            "VALUES (:id, :name, NULL, 'GENERAL', 'INTERNAL', now()) ON CONFLICT (id) DO NOTHING"
+        ),
+        {"id": DEFAULT_WORKSPACE_ID, "name": DEFAULT_WORKSPACE_NAME},
+    )
+    conn.execute(
+        text(f"ALTER TABLE documents ADD COLUMN IF NOT EXISTS workspace_id UUID NOT NULL DEFAULT '{DEFAULT_WORKSPACE_ID}'")
+    )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_workspace_id ON documents (workspace_id)"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS relative_path VARCHAR(1024)"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS size_bytes BIGINT"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS mime_type VARCHAR(128)"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_last_modified TIMESTAMPTZ"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS indexed_at TIMESTAMPTZ"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'indexed'"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS index_progress INTEGER"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_status ON documents (status)"))
+    # One document per synced file: makes a repeated sync idempotent at the
+    # database level, not just in the service.
+    conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_documents_workspace_relative_path "
+            "ON documents (workspace_id, relative_path) WHERE relative_path IS NOT NULL"
+        )
+    )
+    conn.execute(text("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS workspace_id UUID"))
+    conn.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS visibility VARCHAR(16) NOT NULL DEFAULT 'private'"))
+    # Personal documents (Document.subject_user_id). NULL for every existing
+    # document: nothing becomes more or less visible until someone assigns one.
+    conn.execute(
+        text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS subject_user_id UUID REFERENCES users(id) ON DELETE SET NULL")
+    )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_subject_user_id ON documents (subject_user_id)"))
+    # "sync" | "upload" | NULL for every existing document (treated as before).
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS origin VARCHAR(16)"))
+    conn.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_conversations_workspace_id ON conversations (workspace_id)"))
 
     # search_documents page/section enrichment. Nullable and backfilled
     # lazily (only on the next re-ingestion of each document, no forced
@@ -96,6 +141,12 @@ def bootstrap_schema(conn: Connection) -> None:
     # generate_chart (app/agent/chart.py) - chart spec rendered by the
     # frontend, see the Message model's docstring.
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS chart JSONB"))
+    # Structured clarification question (chart dialog) - NULL for old rows.
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS clarification JSONB"))
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS search_results JSONB"))
+    # How the answer was produced (direct / general / documents / web /
+    # hybrid / unavailable) - NULL for old rows (derived by the frontend).
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_mode VARCHAR(16)"))
 
     # Soft-delete for "Supprimer l'historique" (routers/chat.py's
     # delete_history) - see Conversation.deleted_at's docstring. Every read
@@ -120,6 +171,52 @@ def bootstrap_schema(conn: Connection) -> None:
         )
     )
     conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alerts_audit_log_id ON alerts (audit_log_id)"))
+
+    # One alert per security event, not per retry - see
+    # app/core/alert_service.py's deduplication. Existing alerts keep NULL.
+    conn.execute(text("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS dedup_key VARCHAR(64)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_alerts_dedup_key ON alerts (dedup_key, created_at)"))
+
+    # Server folder sources (app/services/source_scanner.py) and the
+    # per-document failure reason/attempt counter of the background workers.
+    # All nullable or defaulted: existing workspaces/documents are unchanged.
+    conn.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS source_root VARCHAR(16)"))
+    conn.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS source_path VARCHAR(1024)"))
+    conn.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS source_enabled BOOLEAN NOT NULL DEFAULT true"))
+    conn.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS source_status VARCHAR(16)"))
+    conn.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS source_error TEXT"))
+    conn.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS source_scan_started_at TIMESTAMPTZ"))
+    conn.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS source_scan_seen INTEGER"))
+    conn.execute(text("ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS source_scan_requested_at TIMESTAMPTZ"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS index_error TEXT"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS index_attempts INTEGER NOT NULL DEFAULT 0"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_source_files_state ON source_files (workspace_id, state)"))
+    conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS issue_kind VARCHAR(32)"))
+    conn.execute(text("ALTER TABLE source_files ADD COLUMN IF NOT EXISTS file_count INTEGER"))
+    # Images and scans with no text were recorded as "failed" before
+    # ExtractionError.kind existed: they are not errors. Reclassified from
+    # their stored reason - idempotent, touches nothing else.
+    conn.execute(
+        text(
+            "UPDATE documents SET status = 'no_text', issue_kind = 'no_text_image' "
+            "WHERE status = 'failed' AND issue_kind IS NULL AND index_error ILIKE '%aucun texte détecté par OCR%'"
+        )
+    )
+    conn.execute(
+        text(
+            "UPDATE documents SET status = 'no_text', issue_kind = 'no_text_scan' "
+            "WHERE status = 'failed' AND issue_kind IS NULL AND index_error ILIKE '%même après OCR%'"
+        )
+    )
+    conn.execute(
+        text(
+            "UPDATE documents SET issue_kind = CASE "
+            "WHEN index_error ILIKE '%embeddings impossibles%' THEN 'embedding' "
+            "WHEN index_error ILIKE '%aucune donnée%' OR index_error ILIKE '%aucun texte%' THEN 'empty' "
+            "ELSE 'corrupt' END "
+            "WHERE status = 'failed' AND issue_kind IS NULL AND index_error IS NOT NULL"
+        )
+    )
 
 
 def bootstrap_roles_and_grants(conn: Connection, settings: Settings) -> None:

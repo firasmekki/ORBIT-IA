@@ -11,7 +11,7 @@ export default defineConfig({
       // In dev, talk to the backend directly; in the Docker image the
       // same /api prefix is proxied by nginx instead (see nginx.conf).
       '/api': {
-        target: process.env.VITE_API_PROXY_TARGET || 'http://localhost:8000',
+        target: process.env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:8095',
         changeOrigin: true,
       },
     },
