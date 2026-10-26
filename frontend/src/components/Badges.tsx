@@ -16,7 +16,11 @@ export function ConfidentialityBadge({ level }: { level: string }) {
   return <span className={`badge badge-conf-${level}`}>{level}</span>
 }
 
-export function DecisionBadge({ decision }: { decision: 'ALLOW' | 'DENY' | string }) {
+export function DecisionBadge({ decision }: { decision: 'ALLOW' | 'DENY' | 'ERROR' | string }) {
+  if (decision === 'ERROR') {
+    // Not found / invalid / unavailable - an error, never a refusal.
+    return <span className="badge badge-error">Erreur</span>
+  }
   if (decision !== 'ALLOW' && decision !== 'DENY') {
     return <span className="badge badge-system">Système</span>
   }

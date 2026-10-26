@@ -7,16 +7,26 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test": "node --experimental-strip-types --test tests/workspaceSyncPolicy.test.mjs tests/workspaceScanner.test.mjs tests/browserImport.test.mjs tests/reportRendering.test.mjs tests/chartContract.test.mjs tests/folderTree.test.mjs tests/webSearch.test.mjs tests/answerMode.test.mjs tests/whatsappPhone.test.mjs",
+    "test:sync-policy": "node --experimental-strip-types --test tests/workspaceSyncPolicy.test.mjs tests/workspaceScanner.test.mjs tests/browserImport.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
+    "pdfmake": "^0.2.23",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
     "react-router-dom": "^7.18.3",
-    "recharts": "^3.10.1"
+    "recharts": "^3.10.1",
+    "remark-breaks": "^4.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-parse": "^11.0.0",
+    "unified": "^11.0.5"
   },
   "devDependencies": {
+    "@types/mdast": "^4.0.4",
     "@types/node": "^24.13.3",
+    "@types/pdfmake": "^0.2.13",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "^6.1.1",

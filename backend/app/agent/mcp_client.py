@@ -13,6 +13,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 from app.core.config import get_settings
+from app.core.secrets_filter import redact_payload
 
 settings = get_settings()
 
@@ -37,4 +38,6 @@ async def call_tool(session: ClientSession, name: str, arguments: dict) -> dict:
 
     if result.isError and "error" not in parsed:
         parsed = {"error": raw or "tool call failed"}
-    return parsed
+    # Credentials in document text (an "acces.txt" in a project folder) never
+    # reach the model nor the user, whatever the document's classification.
+    return redact_payload(parsed)

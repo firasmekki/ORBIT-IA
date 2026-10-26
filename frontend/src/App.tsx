@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
 import { AuthProvider } from './context/AuthContext'
+import { WorkspaceProvider } from './context/WorkspaceContext'
 import { RequireAuth, RequireRole } from './components/RouteGuards'
 import { AppLayout } from './layout/AppLayout'
 import { LoginPage } from './pages/LoginPage'
@@ -12,6 +13,7 @@ import { AdminPage } from './pages/AdminPage'
 import { PermissionsPage } from './pages/PermissionsPage'
 import { AlertsPage } from './pages/AlertsPage'
 import { AuditLogsPage } from './pages/AuditLogsPage'
+import { ConnectivityPage } from './pages/ConnectivityPage'
 
 export default function App() {
   return (
@@ -21,7 +23,11 @@ export default function App() {
         <Route
           element={
             <RequireAuth>
-              <AppLayout />
+              {/* Workspace + folder watching live above the pages, so the
+                  connected folder keeps syncing whatever page is open. */}
+              <WorkspaceProvider>
+                <AppLayout />
+              </WorkspaceProvider>
             </RequireAuth>
           }
         >
@@ -37,6 +43,10 @@ export default function App() {
                 <AdminPage />
               </RequireRole>
             }
+          />
+          <Route
+            path="/connectivity"
+            element={<ConnectivityPage />}
           />
           <Route
             path="/permissions"

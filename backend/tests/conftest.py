@@ -87,14 +87,17 @@ def db(engine):
     session.execute(
         text(
             "TRUNCATE documents, document_pages, document_chunks, users, "
-            "audit_logs, alerts, conversations, messages RESTART IDENTITY CASCADE"
+            "audit_logs, alerts, conversations, messages, runtime_settings RESTART IDENTITY CASCADE"
         )
     )
     session.commit()
     session.close()
 
 
-def make_document(db, *, title, department, confidentiality, pages, owner_id=None, source_filename=None, created_at=None):
+def make_document(
+    db, *, title, department, confidentiality, pages, owner_id=None, source_filename=None, created_at=None,
+    workspace_id=None, relative_path=None,
+):
     """`pages`: list of (page_no, section, line_offset, text) tuples."""
     content = "\n\n".join(p[3] for p in pages)
     doc = Document(
@@ -105,7 +108,10 @@ def make_document(db, *, title, department, confidentiality, pages, owner_id=Non
         content=content,
         owner_id=owner_id,
         source_filename=source_filename,
+        relative_path=relative_path,
     )
+    if workspace_id is not None:
+        doc.workspace_id = workspace_id
     if created_at is not None:
         doc.created_at = created_at
     db.add(doc)
@@ -193,3 +199,17 @@ def pages_of(db):
     """Returns a document's DocumentPage rows in creation order - lets a
     test link a hand-made chunk to a specific page by index."""
     return lambda document_id: db.query(DocumentPage).filter(DocumentPage.document_id == document_id).order_by(DocumentPage.order_index).all()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_model_server(monkeypatch):
+    """No test may reach the real local model by accident (the intent
+    classifier, a general answer...): an unmocked call fails at once, like a
+    stopped server. Tests that need an answer mock chat_completion /
+    complete_json / httpx as before."""
+    from app.agent import llm_client
+
+    monkeypatch.setattr(llm_client.settings, "llm_base_url", "http://llm-server.invalid:9")
+    llm_client._last_failure.clear()
+    yield
+    llm_client._last_failure.clear()

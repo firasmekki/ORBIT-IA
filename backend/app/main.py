@@ -11,9 +11,16 @@ from app.core.migrations import run_privileged_migration
 from app.core.storage import ensure_bucket
 from app.models import *  # noqa: F401,F403 - populate Base.metadata
 from app.rag.watcher import run_folder_watcher
-from app.routers import admin, audit, auth, chat, documents
+from app.services.embedding_worker import run_embedding_worker
+from app.services.extraction_worker import run_extraction_worker
+from app.routers import admin, audit, auth, chat, connectivity, documents, runtime, sources, websearch, workspaces
+from app.services.source_scanner import run_source_scanner
+from app.services.vision_worker import run_vision_worker
 
 settings = get_settings()
+# uvicorn only configures its own loggers - without this, every
+# orbitia.* INFO line (LLM readiness, chart diagnostics) is silently dropped.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s - %(message)s")
 logger = logging.getLogger("orbitia")
 
 
@@ -26,8 +33,37 @@ async def lifespan(app: FastAPI):
         logger.warning("MinIO unavailable at startup, file uploads will fail until it recovers: %s", exc)
 
     watcher_task = asyncio.create_task(run_folder_watcher())
+    embedding_task = asyncio.create_task(run_embedding_worker())
+    extraction_task = asyncio.create_task(run_extraction_worker(settings.extraction_concurrency))
+    llm_watch_task = asyncio.create_task(_log_llm_readiness())
+    source_scanner_task = asyncio.create_task(run_source_scanner())
+    vision_task = asyncio.create_task(run_vision_worker())
     yield
+    vision_task.cancel()
+    source_scanner_task.cancel()
     watcher_task.cancel()
+    embedding_task.cancel()
+    extraction_task.cancel()
+    llm_watch_task.cancel()
+
+
+async def _log_llm_readiness() -> None:
+    """The model is loaded by the `llm` container, once, independently of
+    this process - startup never waits for it (the UI shows "Chargement du
+    modèle IA..." meanwhile). This only records in the logs when it becomes
+    usable, so a restart's effect is visible: a backend restart finds the
+    model already resident, an `llm` restart reloads it once."""
+    from app.agent.llm_client import get_llm_status
+
+    last = None
+    while True:
+        state = await get_llm_status()
+        if state["status"] != last:
+            logger.info("LLM %s: %s", state["model"], state["message"])
+            last = state["status"]
+        if state["status"] == "ready":
+            return
+        await asyncio.sleep(5)
 
 
 app = FastAPI(title="Orbitia - Private Enterprise AI Agent", version="0.1.0", lifespan=lifespan)
@@ -45,8 +81,14 @@ app.include_router(documents.router)
 app.include_router(chat.router)
 app.include_router(audit.router)
 app.include_router(admin.router)
+app.include_router(workspaces.router)
+app.include_router(sources.router)
+app.include_router(runtime.router)
+app.include_router(websearch.router)
+app.include_router(connectivity.router)
 
 
+@app.get("/health")
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}

@@ -1,6 +1,6 @@
 # Orbitia — Private Enterprise AI Agent (MVP)
 
-Application complète (pas une maquette) démontrant un assistant IA d'entreprise qui recherche dans des documents et données internes **en respectant strictement les permissions RBAC/ABAC de chaque utilisateur**, via un vrai serveur **MCP**, un vrai pipeline **RAG** (pgvector) et un **LLM local (Ollama)** qui ne quitte jamais le réseau privé.
+Application locale d'assistant d'entreprise avec recherche documentaire securisee, MCP, RAG (pgvector), Qwen3 local via llama.cpp et Ollama pour les embeddings.
 
 Voir la note d'architecture complète pour le raisonnement détaillé (corrections apportées à l'idée initiale, comparaison des 3 architectures de confidentialité, modèle de sécurité, plan de développement).
 
@@ -8,14 +8,14 @@ Voir la note d'architecture complète pour le raisonnement détaillé (correctio
 
 Prérequis : Docker Desktop.
 
-```bash
-docker compose up -d --build
+```powershell
+.\start-orbit-ai.ps1
 docker compose run --rm seed
 ```
 
 Puis ouvrez **http://localhost:8081**.
 
-Le premier démarrage télécharge l'image `ollama/ollama` (~9 Go, inclut les libs CUDA) puis les modèles (`llama3.2:1b` + `nomic-embed-text`, ~1,6 Go) via le service `ollama-init`. Tant que ça n'est pas terminé, l'app fonctionne déjà (login, documents, RBAC, audit) mais le chat répond "service momentanément indisponible" plutôt que d'halluciner ou de bloquer.
+Au premier demarrage, le script lance le Qwen3 GGUF local avec llama-server natif. Ollama reste reserve aux embeddings nomic-embed-text; aucun nouveau modele de generation n'est telecharge.
 
 **Vous avez déjà Ollama qui tourne nativement sur votre machine ?** Sautez le téléchargement :
 

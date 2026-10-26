@@ -9,6 +9,8 @@ import {
 } from '../api/endpoints'
 import { useAuth } from '../context/AuthContext'
 import { RoleBadge } from '../components/Badges'
+import { EngineStatusPanel } from '../components/EngineStatusPanel'
+import { WebSearchPanel } from '../components/WebSearchPanel'
 import { toolLabel } from '../lib/tools'
 import type { AdminStats, Role, UserOut } from '../types'
 
@@ -75,6 +77,9 @@ export function AdminPage() {
         <h1>Utilisateurs</h1>
         <p>Page réservée au rôle Directeur — création, modification, rôles et accès personnalisés des comptes employés.</p>
       </div>
+
+      <EngineStatusPanel />
+      <WebSearchPanel />
 
       {stats && (
         <div className="stat-grid">
