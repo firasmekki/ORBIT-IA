@@ -5,7 +5,9 @@
 - **Recherche Web** réutilise les routes et le service Brave existants. Les réglages, le fournisseur, le déclenchement, le cache, les quotas et les sources restent gérés par le panneau d'administration Recherche Web. La page Connectivité en affiche le statut et ouvre ce panneau.
 - **Email générique IMAP/SMTP** utilise IMAP et SMTP chiffrés avec TLS. Il permet la recherche par expéditeur, destinataire, sujet et période, la lecture d'un email et la préparation d'un brouillon. Les tools d'email ne sont proposés au modèle local que si le connecteur est activé, le tool sélectionné et le rôle autorisé pour ce tool.
 
-Google Gmail et Microsoft 365 apparaissent comme intégrations à développer. Aucun jeton OAuth ni faux état connecté n'est créé. Calendriers, stockages, API personnalisées, automatisation et outils industriels restent également non configurés.
+- **Comptes email personnels (Gmail, Outlook)** : chaque utilisateur connecte ses propres boîtes par OAuth, en lecture seule, et peut les interroger dans le chat avec le modèle local. Voir [email-accounts.md](email-accounts.md). Yahoo Mail est préparé mais désactivé tant que Yahoo n'a pas accordé l'accès développeur.
+
+Ce connecteur générique est une boîte **partagée** gérée par l'administrateur ; il est distinct des comptes personnels ci-dessus et n'est pas modifié par eux. Calendriers, stockages, API personnalisées, automatisation et outils industriels restent non configurés.
 
 ## Configurer un compte Email
 
@@ -17,7 +19,7 @@ Dans **Direction → Connectivité → Configurer** :
 4. Choisir séparément les rôles autorisés pour rechercher, lire et préparer des brouillons, puis ceux qui peuvent envoyer après confirmation.
 5. Activer le connecteur et lancer **Tester la connexion**. Le test se connecte à IMAP et s'authentifie à SMTP, sans envoyer de message.
 
-La connexion ne devient « Connectée » qu'après un test réel réussi. Gmail, Microsoft 365 et tout fournisseur qui interdit les mots de passe IMAP/SMTP doivent être configurés avec OAuth, encore à développer pour ces fournisseurs.
+La connexion ne devient « Connectée » qu'après un test réel réussi. Pour une boîte Gmail ou Outlook personnelle, utilisez plutôt les comptes email personnels (OAuth, lecture seule).
 
 ## Envoi explicite
 
