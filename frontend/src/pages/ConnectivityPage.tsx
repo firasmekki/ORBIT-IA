@@ -3,10 +3,9 @@ import {
   connectivityOverview, adminDeleteEmailPassword, adminSetEmailPassword, adminTestEmailConnector,
   adminUpdateEmailConnector, prepareConnectorEmail, readConnectorEmail, searchConnectorEmails,
   sendConnectorEmail, type ConnectivitySnapshot, type ConnectorCard, type EmailHit,
-  gmailAccounts, startGmailOAuth, updateGmailAccount, disconnectGmailAccount, testGmailAccount,
-  searchGmail, readGmail, prepareGmailSend, sendGmail, whatsappContacts, addWhatsAppContact, deleteWhatsAppContact, prepareWhatsApp,
-  type GmailAccount, type WhatsAppContact,
+  whatsappContacts, addWhatsAppContact, deleteWhatsAppContact, prepareWhatsApp, type WhatsAppContact,
 } from '../api/endpoints'
+import { EmailAccountsPanel } from '../components/EmailAccountsPanel'
 import { WebSearchPanel } from '../components/WebSearchPanel'
 import { IconMail } from '../components/Icons'
 import { useAuth } from '../context/AuthContext'
@@ -43,14 +42,6 @@ export function ConnectivityPage() {
   const [draft, setDraft] = useState<Draft>({ to: '', subject: '', body: '' })
   const [pending, setPending] = useState<{ confirmation: string; draft: Draft } | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
-  const [gmail, setGmail] = useState<GmailAccount[]>([])
-  const [gmailConfigured, setGmailConfigured] = useState(false)
-  const [gmailConfigIssues, setGmailConfigIssues] = useState<string[]>([])
-  const [gmailSelected, setGmailSelected] = useState('')
-  const [gmailHits, setGmailHits] = useState<Record<string, unknown>[]>([])
-  const [gmailRead, setGmailRead] = useState<Record<string, unknown> | null>(null)
-  const [gmailDraft, setGmailDraft] = useState({ to: '', subject: '', body: '' })
-  const [gmailPending, setGmailPending] = useState<{ confirmation: string; account_id: string; from: string; draft: { to: string; subject: string; body: string } } | null>(null)
   const [contacts, setContacts] = useState<Record<string, WhatsAppContact>>({})
   const [contact, setContact] = useState<WhatsAppContact>({ name: '', phone: '', category: '' })
   const [waTarget, setWaTarget] = useState('')
@@ -61,8 +52,7 @@ export function ConnectivityPage() {
   const [waErrors, setWaErrors] = useState<{ phone?: string; message?: string }>({})
 
   async function refresh() { setData(await connectivityOverview()) }
-  useEffect(() => { void Promise.all([refresh(), gmailAccounts(), whatsappContacts()]).then(([, g, w]) => { setGmail(g.accounts); setGmailConfigured(g.configured); setGmailConfigIssues(g.configuration.issues); setContacts(w.contacts); setGmailSelected(g.accounts.find((a) => a.primary)?.id ?? g.accounts[0]?.id ?? '') }).catch((e) => setError(e instanceof Error ? e.message : 'Connectivité indisponible.')) }, [])
-  useEffect(() => { const value = new URLSearchParams(location.search).get('gmail_oauth'); if (value) { window.history.replaceState({}, '', location.pathname); void gmailAccounts().then((g) => { setGmail(g.accounts); setGmailConfigured(g.configured); setGmailConfigIssues(g.configuration.issues); setGmailSelected(g.accounts.find((a) => a.primary)?.id ?? g.accounts[0]?.id ?? ''); setSuccess(value === 'connected' ? 'Compte Gmail connecté.' : 'La connexion Google a échoué.') }) } }, [])
+  useEffect(() => { void Promise.all([refresh(), whatsappContacts()]).then(([, w]) => setContacts(w.contacts)).catch((e) => setError(e instanceof Error ? e.message : 'Connectivité indisponible.')) }, [])
 
   async function run<T>(action: () => Promise<T>, after?: (value: T) => void) {
     setBusy(true); setError(null); setSuccess(null)
@@ -76,9 +66,9 @@ export function ConnectivityPage() {
   const email = data.email
   const isDirector = user?.role === 'DIRECTOR'
   const emailCard = data.connectors.find((item) => item.id === 'email_imap')
-  const gmailCard = data.connectors.find((item) => item.id === 'google_gmail')
   const webCard = data.connectors.find((item) => item.id === 'web_search')
-  const future = data.connectors.filter((item) => !['email_imap', 'google_gmail', 'web_search'].includes(item.id))
+  // Personal mailboxes (Gmail, Outlook, Yahoo) have their own section below.
+  const future = data.connectors.filter((item) => !['email_imap', 'google_gmail', 'microsoft_outlook', 'yahoo_mail', 'web_search'].includes(item.id))
   const emailReady = email.enabled && ['configured', 'connected'].includes(email.state)
   const canUseEmail = emailReady && Boolean(user && email.tool_roles.search_emails?.includes(user.role))
   const canReadEmail = emailReady && Boolean(user && email.tool_roles.read_email?.includes(user.role))
@@ -132,10 +122,11 @@ export function ConnectivityPage() {
       <div className="page-header"><h1>Connectivité</h1><p>Connexions externes, outils accessibles à l’assistant et autorisations accordées.</p></div>
       {error && <div className="error-banner" role="alert">{error}</div>}
       {success && <div className="success-banner" role="status">{success}</div>}
+      <EmailAccountsPanel />
       <div className="connector-grid connector-grid-active">
-        {[emailCard, gmailCard, webCard].filter((x): x is ConnectorCard => Boolean(x)).map((connector) => (
+        {[emailCard, webCard].filter((x): x is ConnectorCard => Boolean(x)).map((connector) => (
           <section className="card connector-card" key={connector.id}>
-            <div className="connector-card-heading"><span className="connector-icon" aria-hidden>{['email_imap', 'google_gmail'].includes(connector.id) ? '✉' : '⌕'}</span>
+            <div className="connector-card-heading"><span className="connector-icon" aria-hidden>{connector.id === 'email_imap' ? '✉' : '⌕'}</span>
               <div><h2>{connector.name}</h2><span className={'connector-state connector-state-' + connector.state}>{STATE_LABEL[connector.state] ?? connector.state}</span></div>
             </div>
             <p>{connector.description}</p>
@@ -150,18 +141,8 @@ export function ConnectivityPage() {
                 <button className="btn" disabled={busy} onClick={() => void run(async () => { await adminTestEmailConnector(); await refresh() })}>Tester la connexion</button>
                 <button className="btn" disabled={busy || (!email.credentials_configured && !email.enabled)} onClick={() => void run(async () => { await adminUpdateEmailConnector({ enabled: !email.enabled }); await refresh() })}>{email.enabled ? 'Désactiver' : 'Activer'}</button>
                 <button className="btn" disabled={busy || !email.credentials_configured} onClick={() => void run(adminDeleteEmailPassword, () => { void refresh() })}>Révoquer</button>
-              </> : connector.id === 'google_gmail' ? <button className="btn btn-primary" disabled={!gmailConfigured || busy} onClick={() => void run(async () => { const result = await startGmailOAuth(); window.location.assign(result.url) })}>Ajouter un compte Google</button> : <button className="btn btn-primary" onClick={() => setWebOpen((v) => !v)}>Configurer</button>}
+              </> : <button className="btn btn-primary" onClick={() => setWebOpen((v) => !v)}>Configurer</button>}
             </div>
-            {connector.id === 'google_gmail' && !gmailConfigured && <p className="connector-error">{gmailConfigIssues.length ? gmailConfigIssues.join(' · ') : 'Configuration OAuth incomplète.'}</p>}
-            {connector.id === 'google_gmail' && !gmailConfigured && <details className="gmail-setup-guide"><summary>Étapes de configuration OAuth</summary>
-              <ol>
-                <li>Dans Google Cloud, activez Gmail API, configurez l’écran de consentement et créez un client OAuth de type Web.</li>
-                <li>Ajoutez l’URI exacte <code>http://localhost:8081/api/connectivity/gmail/callback</code> aux URI de redirection autorisées. En production, utilisez HTTPS et la même route.</li>
-                <li>Dans le fichier <code>.env</code> à la racine du projet, renseignez <code>GMAIL_OAUTH_CLIENT_ID</code>, <code>GMAIL_OAUTH_CLIENT_SECRET</code> et <code>GMAIL_OAUTH_REDIRECT_URI</code>. Utilisez les valeurs fournies par Google; le secret reste côté serveur.</li>
-                <li>Créez une clé dédiée d’au moins 32 caractères avec <code>python -c "import secrets; print(secrets.token_urlsafe(32))"</code>, puis renseignez <code>GMAIL_TOKEN_ENCRYPTION_KEY</code>. Une clé générée fait 43 caractères. Les secrets déjà présents ne sont pas remplacés automatiquement.</li>
-                <li>Recréez le backend pour charger les variables : <code>docker compose up -d --no-deps backend</code>, puis revenez ici et ajoutez un compte Google.</li>
-              </ol>
-            </details>}
             {connector.id === 'email_imap' && email.last_status?.checked_at && <small>Dernière vérification : {new Date(email.last_status.checked_at).toLocaleString()}</small>}
           </section>
         ))}
@@ -178,7 +159,7 @@ export function ConnectivityPage() {
               <button className="btn connector-close" type="button" aria-label="Fermer la configuration Email" onClick={() => setConfigOpen(false)}>Fermer</button>
             </div>
           </header>
-          <p className="connector-config-intro">Connecteur générique conservé pour les fournisseurs IMAP/SMTP. Pour Google, ajoutez les comptes dans la section Gmail multi-comptes avec OAuth; aucun mot de passe Gmail n’est demandé ici.</p>
+          <p className="connector-config-intro">Boîte partagée IMAP/SMTP gérée par l’administrateur, distincte des comptes personnels. Pour un compte Gmail ou Outlook personnel, utilisez la section « Comptes email connectés » (OAuth, lecture seule) ; aucun mot de passe Gmail ou Microsoft n’est demandé ici.</p>
 
           <section className="connector-form-section" aria-labelledby="connector-connection-title">
             <div className="connector-section-heading"><div><h3 id="connector-connection-title">Paramètres de connexion</h3><p>Renseignez les serveurs fournis par votre service de messagerie.</p></div></div>
@@ -239,42 +220,6 @@ export function ConnectivityPage() {
         </form>
       </section>}
       {isDirector && webOpen && <section className="connector-config"><WebSearchPanel /></section>}
-      {gmail.length > 0 && <section className="card connector-workbench">
-        <h2>Comptes Gmail autorisés</h2>
-        {gmail.map((account) => <div className="toolbar" key={account.id}>
-          <span><strong>{account.name}</strong> · {account.email} · {account.status}{account.primary ? ' · Principal' : ''}{account.last_sync ? ` · Dernière recherche ${new Date(account.last_sync).toLocaleString()}` : ''}{account.error ? ` · ${account.error}` : ''}</span>
-          <button className="btn" disabled={!gmailConfigured || busy} onClick={() => void run(async () => { await testGmailAccount(account.id); const g = await gmailAccounts(); setGmail(g.accounts) })}>Tester</button>
-          <button className="btn" disabled={!gmailConfigured || busy} onClick={() => void run(async () => { const g = await updateGmailAccount(account.id, { enabled: !account.enabled }); setGmail(g.accounts) })}>{account.enabled ? 'Désactiver' : 'Activer'}</button>
-          {!account.send_enabled && <button className="btn" disabled={!gmailConfigured || busy} onClick={() => void run(async () => { const result = await startGmailOAuth(true, account.id); window.location.assign(result.url) })}>Autoriser l'envoi (Google)</button>}
-          {!account.primary && <button className="btn" disabled={busy} onClick={() => void run(async () => { const g = await updateGmailAccount(account.id, { primary: true }); setGmail(g.accounts) })}>Définir principal</button>}
-          <button className="btn" disabled={busy} onClick={() => void run(async () => { const g = await disconnectGmailAccount(account.id); setGmail(g.accounts); setGmailSelected(g.accounts[0]?.id ?? '') })}>Déconnecter et révoquer</button>
-        </div>)}
-        {gmailConfigured && gmail.some((a) => a.enabled && a.status === 'connected') && <form className="connector-search-form" onSubmit={(e) => { e.preventDefault(); if (gmailSelected) void run(async () => setGmailHits((await searchGmail(gmailSelected, filters)).messages as unknown as Record<string, unknown>[])) }}>
-          <select className="input" aria-label="Compte Gmail" value={gmailSelected} onChange={(e) => setGmailSelected(e.target.value)}>{gmail.filter((a) => a.enabled && a.status === 'connected').map((a) => <option key={a.id} value={a.id}>{a.email}</option>)}</select>
-          <input className="input" placeholder="Expéditeur" value={filters.from} onChange={(e) => setFilters({ ...filters, from: e.target.value })} />
-          <input className="input" placeholder="Sujet" value={filters.subject} onChange={(e) => setFilters({ ...filters, subject: e.target.value })} />
-          <input className="input" type="date" aria-label="Depuis le" value={filters.since} onChange={(e) => setFilters({ ...filters, since: e.target.value })} />
-          <input className="input" type="date" aria-label="Jusqu'au" value={filters.before} onChange={(e) => setFilters({ ...filters, before: e.target.value })} />
-          <button className="btn btn-primary" disabled={busy}>Rechercher dans Gmail</button>
-        </form>}
-        {gmailHits.map((hit) => <button className="connector-mail-row" key={String(hit.id)} disabled={busy || !gmailSelected} onClick={() => void run(async () => setGmailRead(await readGmail(gmailSelected, String(hit.id))))}><strong>{String(hit.subject || '(sans objet)')}</strong><span>{String(hit.from)} · {String(hit.date)}</span><span>{String(hit.snippet ?? '')}</span></button>)}
-        {gmailRead && <article className="connector-mail-reader"><h3>{String(gmailRead.subject ?? '')}</h3><p>{String(gmailRead.from ?? '')} → {String(gmailRead.to ?? '')} · {String(gmailRead.date ?? '')}</p><pre>{String(gmailRead.body ?? '')}</pre></article>}
-        <p className="muted">Recherche à la demande, en lecture seule. Le contenu complet n'est pas conservé. Les pièces jointes ne sont pas téléchargées.</p>
-      </section>}
-
-      {gmailConfigured && gmail.some((a) => a.enabled && a.status === 'connected' && a.send_enabled) && <section className="card connector-workbench">
-        <h2>Préparer un email Gmail</h2><p>L'envoi n'est proposé qu'après autorisation Google du scope gmail.send et exige une confirmation explicite du contenu exact.</p>
-        <form className="connector-draft-form" onSubmit={(e) => { e.preventDefault(); if (!gmailSelected) return; void run(async () => { const result = await prepareGmailSend({ account_id: gmailSelected, ...gmailDraft }); setGmailPending(result) }) }}>
-          <label>Compte expéditeur<select className="input" value={gmailSelected} onChange={(e) => { setGmailSelected(e.target.value); setGmailPending(null) }}>{gmail.filter((a) => a.enabled && a.send_enabled).map((a) => <option key={a.id} value={a.id}>{a.email}</option>)}</select></label>
-          <label>Destinataire<input className="input" type="email" required value={gmailDraft.to} onChange={(e) => { setGmailDraft({ ...gmailDraft, to: e.target.value }); setGmailPending(null) }} /></label>
-          <label>Objet<input className="input" required value={gmailDraft.subject} onChange={(e) => { setGmailDraft({ ...gmailDraft, subject: e.target.value }); setGmailPending(null) }} /></label>
-          <label>Message<textarea className="input" rows={6} required value={gmailDraft.body} onChange={(e) => { setGmailDraft({ ...gmailDraft, body: e.target.value }); setGmailPending(null) }} /></label>
-          <button className="btn" disabled={busy}>Préparer et vérifier</button>
-        </form>
-        {gmailPending && <div className="connector-confirm"><h3>Confirmez cet envoi Gmail</h3><p><strong>De :</strong> {gmailPending.from}<br /><strong>À :</strong> {gmailPending.draft.to}<br /><strong>Objet :</strong> {gmailPending.draft.subject}</p><pre>{gmailPending.draft.body}</pre>
-          <button className="btn btn-primary" disabled={busy} onClick={() => void run(async () => { const result = await sendGmail({ ...gmailPending.draft, account_id: gmailPending.account_id, confirmation: gmailPending.confirmation }); setGmailPending(null); setSuccess(`Email envoyé à ${result.to}.`) })}>Confirmer et envoyer</button>
-          <button className="btn" onClick={() => setGmailPending(null)}>Annuler</button><small>Confirmation à usage unique, liée au compte et au contenu exact. Si le résultat est incertain, vérifiez Gmail avant tout nouvel essai.</small></div>}
-      </section>}
 
       <section className="card connector-workbench whatsapp-workbench">
         <header className="whatsapp-header"><div><h2>WhatsApp Click to Chat</h2><p>Gérez vos contacts, puis préparez un lien WhatsApp avec le message à vérifier.</p></div></header>
