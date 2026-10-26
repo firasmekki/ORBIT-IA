@@ -1,19 +1,19 @@
-"""Director-managed connectors and permission-checked email actions."""
+"""Director-managed connectors (shared IMAP/SMTP mailbox, web search) and
+WhatsApp click-to-chat links. Personal mailboxes (Gmail, Outlook) live in
+routers/email_accounts.py - read-only, per user."""
 
 import copy
 import secrets
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
 from app.connectivity import email as email_connector
-from app.connectivity import gmail as gmail_connector
+from app.connectivity.email_accounts.service import provider_issues
 from app.connectivity.registry import list_connectors
 from app.core.audit_logger import log_event
-from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.deps import get_current_user, require_role
 from app.models.audit import AuditLog
@@ -90,20 +90,15 @@ def _email_tool_access(db: Session, user: User, name: str) -> None:
 def _snapshot(db: Session) -> dict:
     web = load_config(db)
     connectors = list_connectors(db)
-    rows = (db.query(AuditLog).filter(AuditLog.resource_type.in_(("connector", "email", "websearch")))
+    rows = (db.query(AuditLog).filter(AuditLog.resource_type.in_(("connector", "email", "email_account", "websearch")))
             .order_by(AuditLog.created_at.desc()).limit(50).all())
     history = [{"at": row.created_at.isoformat() if row.created_at else None, "user": row.username,
                 "action": row.action, "connector": row.resource_id or row.resource_type,
                 "status": row.decision, "correlation_id": str(row.id), "error": row.reason if row.decision == "ERROR" else None}
                for row in rows]
     return {"connectors": connectors, "email": email_connector.public_config(db),
-            "gmail": {"configured": gmail_connector.configured()},
+            "gmail": {"configured": not provider_issues("gmail")},
             "web_search": {**web.public(), "last_status": web_last_status()}, "history": history}
-
-
-class GmailAccountPatch(BaseModel):
-    enabled: bool | None = None
-    primary: bool | None = None
 
 
 class WhatsAppContactIn(BaseModel):
@@ -118,25 +113,6 @@ class WhatsAppPrepareIn(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
 
 
-class GmailReadIn(BaseModel):
-    message_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
-
-
-class GmailThreadIn(BaseModel):
-    thread_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
-
-
-class GmailSendDraftIn(BaseModel):
-    account_id: str = Field(min_length=1, max_length=40)
-    to: str = Field(min_length=3, max_length=254)
-    subject: str = Field(min_length=1, max_length=200)
-    body: str = Field(min_length=1, max_length=8000)
-
-
-class GmailSendIn(GmailSendDraftIn):
-    confirmation: str = Field(min_length=32, max_length=64)
-
-
 def _contacts(db: Session, user_id: str) -> dict:
     row = db.get(RuntimeSetting, "whatsapp_contacts")
     return copy.deepcopy((row.value or {}).get(user_id, {})) if row else {}
@@ -148,155 +124,6 @@ def _save_contacts(db: Session, user_id: str, username: str, contacts: dict) -> 
     values[user_id] = contacts
     row.value = values; row.updated_by = username
     db.add(row); db.commit()
-
-
-@router.get("/api/connectivity/gmail/accounts")
-def gmail_accounts(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    configuration = gmail_connector.configuration_status()
-    account_list = gmail_connector.accounts(db, str(user.id))
-    if not configuration["ready"]:
-        for account in account_list:
-            account["status"] = "not_configured"
-            account["error"] = "Configuration OAuth serveur incomplète."
-    return {"accounts": account_list, "configured": configuration["ready"],
-            "configuration": configuration}
-
-
-@router.post("/api/connectivity/gmail/oauth/start")
-def gmail_oauth_start(enable_send: bool = False, account_id: str | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    try:
-        url = gmail_connector.start(db, str(user.id), user.username, enable_send=enable_send, account_id=account_id)
-        log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_OAUTH_STARTED", decision="ALLOW",
-                  resource_type="email", resource_id="redacted", reason="consent_requested",
-                  extra={"send_scope_requested": enable_send})
-        return {"url": url}
-    except ValueError as exc: raise HTTPException(400, str(exc)) from None
-
-
-@router.get("/api/connectivity/gmail/callback")
-def gmail_oauth_callback(state: str, code: str | None = None, error: str | None = None,
-                        db: Session = Depends(get_db)):
-    front = get_settings().gmail_frontend_redirect_uri
-    if error or not code:
-        return RedirectResponse(front + "?gmail_oauth=error")
-    try:
-        user_id = gmail_connector.finish(db, state, code)
-        user = db.get(User, user_id)
-        if user:
-            log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_OAUTH_COMPLETED", decision="ALLOW",
-                      resource_type="email", resource_id="redacted", reason="consent_granted")
-    except Exception: return RedirectResponse(front + "?gmail_oauth=error")
-    return RedirectResponse(front + "?gmail_oauth=connected")
-
-
-@router.patch("/api/connectivity/gmail/accounts/{account_id}")
-def gmail_account_update(account_id: str, payload: GmailAccountPatch, db: Session = Depends(get_db),
-                         user: User = Depends(get_current_user)):
-    try:
-        result = gmail_connector.update_account(db, str(user.id), user.username, account_id, **payload.model_dump(exclude_unset=True))
-        log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_ACCOUNT_UPDATED", decision="ALLOW",
-                  resource_type="email", resource_id="redacted", reason="settings_changed",
-                  extra=payload.model_dump(exclude_unset=True))
-        return {"accounts": result}
-    except ValueError as exc: raise HTTPException(404, str(exc)) from None
-
-
-@router.delete("/api/connectivity/gmail/accounts/{account_id}")
-def gmail_account_disconnect(account_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    gmail_connector.disconnect(db, str(user.id), user.username, account_id)
-    log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_ACCOUNT_DISCONNECTED", decision="ALLOW",
-              resource_type="email", resource_id="redacted", reason="token_revoked_and_removed")
-    return {"accounts": gmail_connector.accounts(db, str(user.id))}
-
-
-@router.post("/api/connectivity/gmail/accounts/{account_id}/test")
-def gmail_account_test(account_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    try:
-        token = gmail_connector._access_token(db, str(user.id), account_id)
-        import httpx
-        with httpx.Client(timeout=12) as client:
-            response = gmail_connector._gmail_get(client, "https://gmail.googleapis.com/gmail/v1/users/me/profile",
-                                                  headers={"Authorization": f"Bearer {token}"})
-            response.raise_for_status()
-        log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_CONNECTION_TEST", decision="ALLOW",
-                  resource_type="email", resource_id="redacted", reason="connected")
-        return {"state": "connected", "email": response.json().get("emailAddress")}
-    except Exception as exc:
-        code = getattr(getattr(exc, "response", None), "status_code", None)
-        gmail_connector.mark_status(db, str(user.id), account_id,
-                                    "auth_expired" if code == 401 else "connection_error",
-                                    "Autorisation expirée." if code == 401 else "Erreur Gmail API.")
-        log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_CONNECTION_TEST", decision="ERROR",
-                  resource_type="email", resource_id="redacted", reason="connection_failed")
-        raise HTTPException(502, "Test Gmail impossible ; reconnectez le compte si nécessaire.") from None
-
-
-@router.post("/api/connectivity/gmail/accounts/{account_id}/search")
-def gmail_search(account_id: str, payload: EmailSearchIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    # Gmail's native query syntax is accepted as `subject` when supplied; the other
-    # fields are converted to Gmail search operators without storing mailbox data.
-    terms = []
-    args = payload.model_dump(by_alias=True, exclude_none=True)
-    if args.get("from"): terms.append("from:" + args["from"])
-    if args.get("to"): terms.append("to:" + args["to"])
-    if args.get("subject"): terms.append("subject:(" + args["subject"].replace("\\", " ") + ")")
-    if args.get("since"): terms.append("after:" + args["since"].replace("-", "/"))
-    if args.get("before"): terms.append("before:" + args["before"].replace("-", "/"))
-    try:
-        result = gmail_connector.search(db, str(user.id), account_id, " ".join(terms), payload.limit)
-        log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_SEARCH", decision="ALLOW",
-                  resource_type="email", resource_id="redacted", reason="ok", extra={"result_count": result["count"]})
-        return result
-    except Exception:
-        raise HTTPException(502, "Recherche Gmail impossible ; vérifiez le statut du compte.") from None
-
-
-@router.post("/api/connectivity/gmail/accounts/{account_id}/read")
-def gmail_read(account_id: str, payload: GmailReadIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    try:
-        result = gmail_connector.read_message(db, str(user.id), account_id, payload.message_id)
-        log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_READ", decision="ALLOW",
-                  resource_type="email", resource_id="redacted", reason="ok")
-        return result
-    except Exception:
-        raise HTTPException(404, "Message Gmail indisponible.") from None
-
-
-@router.post("/api/connectivity/gmail/accounts/{account_id}/read-thread")
-def gmail_read_thread(account_id: str, payload: GmailThreadIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    try:
-        result = gmail_connector.read_thread(db, str(user.id), account_id, payload.thread_id)
-        log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_THREAD_READ", decision="ALLOW",
-                  resource_type="email", resource_id="redacted", reason="ok", extra={"message_count": result["count"]})
-        return result
-    except Exception:
-        raise HTTPException(404, "Conversation Gmail indisponible.") from None
-
-
-@router.post("/api/connectivity/gmail/send/prepare")
-def gmail_send_prepare(payload: GmailSendDraftIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    try:
-        result = gmail_connector.prepare_send(db, str(user.id), payload.account_id, payload.model_dump(exclude={"account_id"}))
-    except ValueError as exc:
-        raise HTTPException(403, str(exc)) from None
-    log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_SEND_PREPARED", decision="ALLOW",
-              resource_type="email", resource_id="redacted", reason="confirmation_required")
-    return {**result, "account_id": payload.account_id}
-
-
-@router.post("/api/connectivity/gmail/send")
-def gmail_send(payload: GmailSendIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    try:
-        result = gmail_connector.send_confirmed(db, str(user.id), payload.account_id,
-            payload.model_dump(exclude={"account_id", "confirmation"}), payload.confirmation)
-    except ValueError as exc:
-        log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_SEND", decision="ERROR",
-                  resource_type="email", resource_id="redacted",
-                  reason="send_result_uncertain" if "incertain" in str(exc).lower() else "confirmation_refused")
-        raise HTTPException(409, str(exc)) from None
-    log_event(user_id=user.id, username=user.username, role=user.role, action="GMAIL_SEND", decision="ALLOW",
-              resource_type="email", resource_id="redacted", reason="user_confirmed")
-    return result
 
 
 @router.get("/api/connectivity/whatsapp/contacts")
@@ -343,7 +170,7 @@ def get_connectivity(db: Session = Depends(get_db), _user: User = Depends(requir
 def connectivity_overview(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     if user.role == "DIRECTOR":
         return _snapshot(db)
-    cards = [c for c in list_connectors(db) if c["id"] in ("google_gmail", "whatsapp_business")]
+    cards = [c for c in list_connectors(db) if c["id"] in ("google_gmail", "microsoft_outlook", "yahoo_mail", "whatsapp_business")]
     # Do not expose the administrator-managed IMAP/SMTP or web provider settings.
     empty_email = {"enabled": False, "provider": "imap_smtp", "imap_host": "", "imap_port": 993,
         "imap_ssl": True, "smtp_host": "", "smtp_port": 465, "smtp_ssl": True, "username": "", "mailbox": "INBOX",

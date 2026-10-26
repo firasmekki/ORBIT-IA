@@ -4,7 +4,7 @@ import logging
 import time
 import uuid
 from typing import Annotated
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -480,6 +480,7 @@ async def chat(
             workspace_name=_scoped_name(workspace, folder_scope, folder_depth),
             folder_scope=folder_scope,
             folder_depth=folder_depth,
+            timezone=payload.timezone,
         )
 
     if vision_trace is not None:  # the vision model really ran: shown first in "actions effectuées"
@@ -626,7 +627,12 @@ def _persist_assistant_turn(
     result.answer = redact_secrets(result.answer)
     result.sources = redact_payload(result.sources)
     result.search_results = redact_payload(result.search_results) if result.search_results else None
+    result.email_results = redact_payload(result.email_results) if result.email_results else None
     result.tool_trace = redact_payload(result.tool_trace)
+    email_expiry = (
+        datetime.now(UTC) + timedelta(days=get_settings().email_results_retention_days)
+        if result.email_results or result.answer_mode == "email" else None
+    )
     assistant_msg = Message(
         conversation_id=conv.id,
         role="assistant",
@@ -637,6 +643,8 @@ def _persist_assistant_turn(
         chart=result.chart,
         clarification=result.clarification,
         search_results=result.search_results,
+        email_results=result.email_results,
+        email_results_expires_at=email_expiry,
         answer_mode=answer_mode(result),
     )
     db.add(assistant_msg)
@@ -720,6 +728,7 @@ def _persist_assistant_turn(
             chart=assistant_msg.chart,
             clarification=assistant_msg.clarification,
             search_results=assistant_msg.search_results,
+            email_results=assistant_msg.email_results,
             answer_mode=assistant_msg.answer_mode,
             created_at=assistant_msg.created_at,
         ),

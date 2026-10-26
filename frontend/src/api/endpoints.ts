@@ -1,4 +1,5 @@
 import { api } from './client'
+import { browserTimeZone } from '../lib/emailAccounts'
 import type {
   AdminStats,
   AlertPage,
@@ -275,6 +276,8 @@ export function sendChatMessage(
     image: image ?? null,
     folder_scope: folderScope && folderScope.length ? folderScope : null,
     scope_mode: scopeMode,
+    // "aujourd'hui" / "cette semaine" in a mailbox question = the user's own day
+    timezone: browserTimeZone() ?? null,
   })
 }
 
@@ -469,16 +472,57 @@ export function sendConnectorEmail(draft: { to: string; subject: string; body: s
   return api.post<{ status: string; to: string; subject: string }>('/connectivity/email/send', draft)
 }
 
-export type GmailAccount = { id: string; email: string; name: string; enabled: boolean; primary: boolean; send_enabled?: boolean; status: string; last_sync: string | null; error: string | null }
-export function gmailAccounts() { return api.get<{ accounts: GmailAccount[]; configured: boolean; configuration: { ready: boolean; issues: string[] } }>('/connectivity/gmail/accounts') }
-export function startGmailOAuth(enableSend = false, accountId?: string) { const qs = new URLSearchParams(); if (enableSend) qs.set('enable_send', 'true'); if (accountId) qs.set('account_id', accountId); return api.post<{ url: string }>(`/connectivity/gmail/oauth/start${qs.size ? `?${qs}` : ''}`, {}) }
-export function updateGmailAccount(id: string, values: { enabled?: boolean; primary?: boolean }) { return api.patch<{ accounts: GmailAccount[] }>(`/connectivity/gmail/accounts/${encodeURIComponent(id)}`, values) }
-export function disconnectGmailAccount(id: string) { return api.delete<{ accounts: GmailAccount[] }>(`/connectivity/gmail/accounts/${encodeURIComponent(id)}`) }
-export function testGmailAccount(id: string) { return api.post<{ state: string; email: string }>(`/connectivity/gmail/accounts/${encodeURIComponent(id)}/test`, {}) }
-export function searchGmail(id: string, filters: { from?: string; to?: string; subject?: string; since?: string; before?: string; limit?: number }) { return api.post<{ messages: EmailHit[]; count: number }>(`/connectivity/gmail/accounts/${encodeURIComponent(id)}/search`, filters) }
-export function readGmail(id: string, messageId: string) { return api.post<Record<string, unknown>>(`/connectivity/gmail/accounts/${encodeURIComponent(id)}/read`, { message_id: messageId }) }
-export function prepareGmailSend(draft: { account_id: string; to: string; subject: string; body: string }) { return api.post<{ confirmation: string; expires_in_seconds: number; from: string; draft: Omit<typeof draft, 'account_id'>; account_id: string }>('/connectivity/gmail/send/prepare', draft) }
-export function sendGmail(payload: { account_id: string; to: string; subject: string; body: string; confirmation: string }) { return api.post<{ status: string; to: string; subject: string }>('/connectivity/gmail/send', payload) }
+// Personal mailboxes (Gmail, Outlook; Yahoo prepared, disabled) - read-only,
+// each user sees and uses only their own connections (routers/email_accounts.py).
+export type EmailProviderId = 'gmail' | 'outlook' | 'yahoo'
+export type EmailProviderStatus = {
+  provider: EmailProviderId; label: string; configured: boolean; enabled: boolean; pending: boolean
+  issues: string[]; status: string; permission: string
+  capabilities: { deep_link: boolean; programmatic_revoke: boolean; threads: string }
+}
+export type EmailAccount = {
+  id: string; provider: EmailProviderId; provider_label: string; email_address: string
+  display_name: string | null; label: string | null; account_kind: string | null
+  status: string; status_label: string; error: { code: string; category: string; message: string } | null
+  permission: string; read_permission_granted: boolean; is_enabled: boolean; is_primary: boolean
+  token_state: 'valid' | 'expired_refreshable' | 'absent'; access_token_expires_at: string | null
+  last_checked_at: string | null; last_success_at: string | null; connected_at: string | null
+  capabilities: { deep_link: boolean; programmatic_revoke: boolean }
+}
+export type EmailListItem = {
+  ref: string; thread_ref: string | null; sender: { address: string; name: string | null } | null
+  subject: string | null; received_at: string | null; snippet: string | null; is_unread: boolean | null
+  has_attachments: boolean | null; web_link: string | null
+}
+export function emailAccounts() {
+  return api.get<{ accounts: EmailAccount[]; providers: EmailProviderStatus[] }>('/connectivity/email-accounts')
+}
+export function startEmailOAuth(provider: EmailProviderId, reconnect?: string) {
+  const qs = reconnect ? `?reconnect=${encodeURIComponent(reconnect)}` : ''
+  return api.post<{ url: string }>(`/connectivity/email-accounts/${provider}/oauth/start${qs}`, {})
+}
+export function updateEmailAccount(id: string, values: { is_enabled?: boolean; is_primary?: boolean; label?: string }) {
+  return api.patch<{ accounts: EmailAccount[] }>(`/connectivity/email-accounts/${encodeURIComponent(id)}`, values)
+}
+export function disconnectEmailAccount(id: string) {
+  return api.delete<{ revocation: 'revoked' | 'not_supported' | 'failed'; manual_revoke_url: string | null; accounts: EmailAccount[] }>(
+    `/connectivity/email-accounts/${encodeURIComponent(id)}`)
+}
+export function testEmailAccount(id: string) {
+  return api.post<{ account: EmailAccount }>(`/connectivity/email-accounts/${encodeURIComponent(id)}/test`, {})
+}
+export function refreshEmailAccountStatus(id: string) {
+  return api.post<{ account: EmailAccount }>(`/connectivity/email-accounts/${encodeURIComponent(id)}/refresh-status`, {})
+}
+export function searchEmailAccount(id: string, filters: { text?: string; from?: string; subject?: string; since?: string; before?: string; unread_only?: boolean; limit?: number; cursor?: string }) {
+  return api.post<{ items: EmailListItem[]; next_cursor: string | null; limit: number }>(
+    `/connectivity/email-accounts/${encodeURIComponent(id)}/messages/search`, filters)
+}
+export function readEmailMessage(id: string, ref: string) {
+  return api.post<{ message: EmailListItem & { body_text: string; body_truncated: boolean; attachments: { filename: string | null; mime_type: string | null; size_bytes: number | null }[] } }>(
+    `/connectivity/email-accounts/${encodeURIComponent(id)}/messages/read`, { ref })
+}
+
 export type WhatsAppContact = { name: string; phone: string; category?: string | null }
 export function whatsappContacts() { return api.get<{ contacts: Record<string, WhatsAppContact> }>('/connectivity/whatsapp/contacts') }
 export function addWhatsAppContact(contact: WhatsAppContact) { return api.post<{ contacts: Record<string, WhatsAppContact> }>('/connectivity/whatsapp/contacts', contact) }

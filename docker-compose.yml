@@ -218,12 +218,25 @@ services:
       SOURCE_ROOT_2_HOST: ${ORBIT_SOURCE_ROOT_2:-}
       SOURCE_ROOT_3_HOST: ${ORBIT_SOURCE_ROOT_3:-}
       SOURCE_SCAN_INTERVAL_SECONDS: ${SOURCE_SCAN_INTERVAL_SECONDS:-600}
-      # Gmail OAuth credentials are backend-only.
+      # Personal mailboxes (read-only, docs/email-accounts.md). OAuth client
+      # secrets and the token encryption key are backend-only.
+      EMAIL_TOKEN_ENCRYPTION_KEY: ${EMAIL_TOKEN_ENCRYPTION_KEY:-}
+      EMAIL_FRONTEND_REDIRECT_URI: ${EMAIL_FRONTEND_REDIRECT_URI:-http://localhost:8081/connectivity}
+      EMAIL_DEFAULT_LIMIT: ${EMAIL_DEFAULT_LIMIT:-10}
+      EMAIL_MAX_LIMIT: ${EMAIL_MAX_LIMIT:-25}
+      EMAIL_RESULTS_RETENTION_DAYS: ${EMAIL_RESULTS_RETENTION_DAYS:-30}
+      EMAIL_DEFAULT_TIMEZONE: ${EMAIL_DEFAULT_TIMEZONE:-UTC}
       GMAIL_OAUTH_CLIENT_ID: ${GMAIL_OAUTH_CLIENT_ID:-}
       GMAIL_OAUTH_CLIENT_SECRET: ${GMAIL_OAUTH_CLIENT_SECRET:-}
       GMAIL_OAUTH_REDIRECT_URI: ${GMAIL_OAUTH_REDIRECT_URI:-http://localhost:8081/api/connectivity/gmail/callback}
+      # Legacy key of the first Gmail connector: only read to migrate its tokens.
       GMAIL_TOKEN_ENCRYPTION_KEY: ${GMAIL_TOKEN_ENCRYPTION_KEY:-}
-      GMAIL_FRONTEND_REDIRECT_URI: ${GMAIL_FRONTEND_REDIRECT_URI:-http://localhost:8081/connectivity}
+      OUTLOOK_OAUTH_CLIENT_ID: ${OUTLOOK_OAUTH_CLIENT_ID:-}
+      OUTLOOK_OAUTH_CLIENT_SECRET: ${OUTLOOK_OAUTH_CLIENT_SECRET:-}
+      OUTLOOK_OAUTH_REDIRECT_URI: ${OUTLOOK_OAUTH_REDIRECT_URI:-http://localhost:8081/api/connectivity/outlook/callback}
+      OUTLOOK_OAUTH_AUTHORITY: ${OUTLOOK_OAUTH_AUTHORITY:-common}
+      # Stays false until Yahoo approves this app for the mail-r scope.
+      YAHOO_MAIL_ENABLED: "false"
     # Folder auto-import (see app/rag/watcher.py). Host path defaults to a
     # project-local folder (created automatically, gitignored) - point
     # WATCH_FOLDER_HOST_PATH in .env at a real folder and set

@@ -1,7 +1,7 @@
 // The discreet line under an assistant answer saying how it was produced
 // (set by the backend: routers/chat.py answer_mode). Nothing is shown for
 // older messages that have no mode: no label is ever guessed.
-export type AnswerMode = 'direct' | 'general' | 'documents' | 'web' | 'hybrid' | 'unavailable'
+export type AnswerMode = 'direct' | 'general' | 'documents' | 'web' | 'hybrid' | 'email' | 'unavailable'
 
 const LABELS: Record<AnswerMode, string> = {
   direct: 'Réponse locale',
@@ -9,6 +9,7 @@ const LABELS: Record<AnswerMode, string> = {
   documents: 'Documents du projet',
   web: 'Recherche Web',
   hybrid: 'Documents + Web',
+  email: 'Boîte mail personnelle · lecture seule · IA locale',
   unavailable: 'Modèle indisponible · aucune réponse rédigée',
 }
 

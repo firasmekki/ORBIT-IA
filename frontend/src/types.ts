@@ -355,9 +355,48 @@ export interface MessageOut {
   chart?: ChartSpec | null
   clarification?: Clarification | null
   search_results?: SearchResults | null
-  /** direct | general | documents | web | hybrid | unavailable (absent on older messages) */
+  email_results?: EmailResults | null
+  /** direct | general | documents | web | hybrid | email | unavailable (absent on older messages) */
   answer_mode?: string | null
   created_at: string
+}
+
+/** Personal mailbox answer (app/agent/email_turn.py): facts from the
+ * provider, the local model's summaries kept apart. */
+export interface EmailResultCard {
+  ref: string
+  web_link: string | null
+  status: 'listed' | 'summarized' | 'facts_only' | 'error'
+  facts: {
+    sender: { address: string; name: string | null } | null
+    subject: string | null
+    received_at: string | null
+    is_unread: boolean | null
+    has_attachments: boolean | null
+    attachments: { filename: string | null; mime_type: string | null; size_bytes: number | null }[]
+    snippet: string | null
+  }
+  ai: { summary: string | null; requests: string[]; decisions: string[]; needs_action: boolean } | null
+  deadlines: { text: string; evidence: string }[]
+  suggestions: string[]
+  note?: string
+  error?: string
+}
+
+export interface EmailResults {
+  type: 'email_results'
+  expired?: boolean
+  account?: { id: string; provider: string; provider_label: string; email_address: string; label: string | null }
+  query?: { limit: number; limit_is_default: boolean; period: string | null; unread_only: boolean; from: string | null; needs_action: boolean; timezone?: string }
+  items: EmailResultCard[]
+  total_examined: number
+  report: {
+    facts: { examined: number; unread: number; with_attachments: number; senders: string[] }
+    ai: { summarized: number; needs_action: number; deadlines: { subject: string | null; text: string; evidence: string }[] }
+    suggestions: string[]
+  } | null
+  notices: string[]
+  has_more?: boolean
 }
 
 // Local File Workspace (Phase 1, read-only) - see app/agent/local_files.py

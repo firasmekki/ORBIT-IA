@@ -3,6 +3,7 @@ from app.models.alert import Alert
 from app.models.audit import AuditLog
 from app.models.chat import Conversation, Message
 from app.models.document import Document, DocumentChunk
+from app.models.email_connection import EmailConnection, EmailOAuthState
 from app.models.finance import FinancialRecord
 from app.models.runtime_setting import RuntimeSetting
 from app.models.source_file import SourceFile
@@ -17,6 +18,8 @@ __all__ = [
     "Document",
     "DocumentAccessRule",
     "DocumentChunk",
+    "EmailConnection",
+    "EmailOAuthState",
     "FinancialRecord",
     "RestrictedFolder",
     "RuntimeSetting",
