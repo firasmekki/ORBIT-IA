@@ -149,7 +149,13 @@ def summarize_chart(spec_dict: dict) -> str:
     ).replace(",", " ")
 
 
-_INLINE_ROW_RE = re.compile(r"([^\d:=,;\n]{2,40}?)\s*[:=]\s*(-?\d[\d\s.,]*|inconnu|nc|n/?a)\b", re.IGNORECASE)
+# Label: any short text, digits included ("2024: 120000" - a year is a
+# label like any other). Value: one number only - "120 000", "4,5",
+# "1 200 000" - so "2024: 120000, 2025: 135000" can never merge into a
+# single "120000, 2025".
+_INLINE_ROW_RE = re.compile(
+    r"([^:=,;\n]{2,40}?)\s*[:=]\s*(-?\d+(?:[ .]\d{3})*(?:[.,]\d+)?|inconnu|nc|n/?a)\b", re.IGNORECASE
+)
 _UNKNOWN_TOKENS = {"inconnu", "nc", "na", "n/a"}
 
 
@@ -186,6 +192,116 @@ def parse_inline_data(message: str) -> list[tuple[str, float | None]] | None:
             return None
         rows.append((label, value))
     return rows
+
+
+# --- reading a worksheet ---------------------------------------------------------
+#
+# Shared by both spreadsheet sources - a company .xlsx re-read from object
+# storage (app/mcp/server.py::_read_spreadsheet_impl) and a file from the
+# user's local Workspace (app/agent/orchestrator.py's local file path) - so
+# both are held to exactly the same parsing rules. Errors are returned as
+# (code, message, error_kind) for the caller to wrap in its own error shape.
+
+
+def resolve_sheet_name(
+    sheet_names: list[str], sheet_hint: str | None, file_label: str
+) -> tuple[str | None, tuple[str, str, str] | None]:
+    """The real sheet a request means - never a guess, never "the first
+    sheet" unless there is genuinely only one to choose from."""
+    if not sheet_names:
+        return None, ("NOT_FOUND", f"« {file_label} » ne contient aucune feuille", "sheet_not_found")
+    if sheet_hint is None:
+        if len(sheet_names) == 1:
+            return sheet_names[0], None
+        return None, (
+            "AMBIGUOUS",
+            f"« {file_label} » contient plusieurs feuilles ({', '.join(sheet_names)}) - précisez laquelle utiliser.",
+            "ambiguous_sheet",
+        )
+    target = normalize(sheet_hint)
+    matches = [s for s in sheet_names if normalize(s) == target] or [s for s in sheet_names if target in normalize(s)]
+    if not matches:
+        return None, (
+            "NOT_FOUND",
+            f"feuille « {sheet_hint} » introuvable dans « {file_label} ». Feuilles disponibles : {', '.join(sheet_names)}",
+            "sheet_not_found",
+        )
+    return matches[0], None
+
+
+def workbook_sheet_names(raw: bytes) -> list[str]:
+    from io import BytesIO
+
+    from openpyxl import load_workbook
+
+    return list(load_workbook(BytesIO(raw), read_only=True).sheetnames)
+
+
+def read_sheet_rows(raw: bytes, sheet_title: str) -> tuple[dict | None, tuple[str, str, str] | None]:
+    """Header row + data rows of one sheet, values exactly as stored (cached
+    formula results, never recomputed, never stringified)."""
+    from io import BytesIO
+
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(BytesIO(raw), data_only=True, read_only=True)
+    worksheet = next((s for s in workbook.worksheets if s.title == sheet_title), None)
+    if worksheet is None:
+        return None, ("NOT_FOUND", f"feuille « {sheet_title} » introuvable dans le fichier original", "sheet_not_found")
+
+    all_rows = list(worksheet.iter_rows(values_only=True))
+    if not all_rows:
+        return None, ("VALIDATION_ERROR", f"la feuille « {sheet_title} » est vide", "empty_sheet")
+
+    headers = [str(c).strip() if c is not None else "" for c in all_rows[0]]
+    rows: list[dict] = []
+    for raw_row in all_rows[1:]:
+        row = {h: v for h, v in zip(headers, raw_row) if h}
+        if any(v is not None for v in row.values()):
+            rows.append(row)
+    return {"headers": [h for h in headers if h], "rows": rows}, None
+
+
+# --- calendar month ordering -------------------------------------------------
+
+_MONTH_INDEX = {
+    name: i
+    for i, names in enumerate(
+        [
+            ("janvier", "janv", "jan", "january"),
+            ("fevrier", "fevr", "fev", "february", "feb"),
+            ("mars", "mar", "march"),
+            ("avril", "avr", "april", "apr"),
+            ("mai", "may"),
+            ("juin", "june", "jun"),
+            ("juillet", "juil", "july", "jul"),
+            ("aout", "aou", "august", "aug"),
+            ("septembre", "sept", "sep", "september"),
+            ("octobre", "oct", "october"),
+            ("novembre", "nov", "november"),
+            ("decembre", "dec", "december"),
+        ]
+    )
+    for name in names
+}
+
+
+def _month_index(value: object) -> int | None:
+    if not isinstance(value, str):
+        return None
+    return _MONTH_INDEX.get(normalize(value).strip(" .\t"))
+
+
+def order_by_calendar_month(data: list[dict], category_field: str) -> list[dict]:
+    """Calendar order (Janvier -> Décembre) when, and only when, every
+    category is a month name - never alphabetical ("Août" before "Avril"),
+    never a dropped or merged row, never a changed value. Anything else
+    (years, products, "Janvier 2025" vs "Janvier 2026", a repeated month)
+    is returned exactly as the source ordered it."""
+    indexes = [_month_index(row.get(category_field)) for row in data]
+    if not data or any(i is None for i in indexes) or len(set(indexes)) != len(indexes):
+        return data
+    return [row for _, row in sorted(zip(indexes, data), key=lambda pair: pair[0])]
 
 
 # --- spreadsheet column resolution ------------------------------------------

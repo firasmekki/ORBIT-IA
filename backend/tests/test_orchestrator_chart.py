@@ -65,7 +65,12 @@ async def test_bar_chart_from_inline_data(monkeypatch):
     )
 
     assert captured["arguments"]["chart_type"] == "bar"
-    assert captured["arguments"]["data"] == [{"label": "RH", "amount": 180000.0}, {"label": "Marketing", "amount": 95000.0}]
+    rows = captured["arguments"]["data"]
+    assert [{"label": r["label"], "amount": r["amount"]} for r in rows] == [
+        {"label": "RH", "amount": 180000.0},
+        {"label": "Marketing", "amount": 95000.0},
+    ]
+    assert all(r["id"] for r in rows)  # every bar carries an identifier for drill-down
     assert captured["arguments"]["sources"] == []
     assert result.chart is not None
     assert result.chart["chart_type"] == "bar"
@@ -148,10 +153,20 @@ async def test_inline_unknown_value_preserved_as_none_never_zero(monkeypatch):
 
     monkeypatch.setattr(orchestrator, "call_tool", fake_call_tool)
 
-    await orchestrator.run_agent_turn(
+    result = await orchestrator.run_agent_turn(
         user_id="u1", grant=_grant(), message="Histogramme : Janvier: 120000, Février: inconnu", history=[]
     )
 
+    # One usable value: a value card, the unknown one said missing - never 0.
+    assert "arguments" not in captured  # no one-bar chart generated
+    assert result.chart["chart_type"] == "kpi"
+    assert [(i["period"], i["value"]) for i in result.chart["data"]] == [("Janvier", 120000.0)]
+    assert "Valeur manquante pour Février : elle n'est pas remplacée par 0." in result.answer
+
+    captured.clear()
+    await orchestrator.run_agent_turn(
+        user_id="u1", grant=_grant(), message="Histogramme : Janvier: 120000, Février: inconnu, Mars: 90000", history=[]
+    )
     row = captured["arguments"]["data"][1]
     assert row["label"] == "Février"
     assert row["amount"] is None  # never coerced to 0
@@ -168,7 +183,10 @@ async def test_falls_back_to_search_database_when_no_inline_data(monkeypatch):
     async def fake_call_tool(session, name, arguments):
         calls.append(name)
         if name == "search_database":
-            return {"results": [{"label": "Budget IT 2025", "amount": 50000.0, "year": 2025, "confidentiality": "CONFIDENTIAL"}]}
+            return {"results": [
+                {"label": "Budget IT 2025", "amount": 50000.0, "year": 2025, "confidentiality": "CONFIDENTIAL"},
+                {"label": "Budget RH 2025", "amount": 40000.0, "year": 2025, "confidentiality": "CONFIDENTIAL"},
+            ]}
         assert name == "generate_chart"
         return {"chart": {**arguments}}
 
@@ -192,8 +210,12 @@ async def test_search_database_empty_results_no_chart_no_fabrication(monkeypatch
 
     result = await orchestrator.run_agent_turn(user_id="u1", grant=_grant(), message="Fais un histogramme des budgets Mars.", history=[])
 
+    # No data: no chart, nothing invented - and a question back to the
+    # user instead of the old dead-end "Aucune donnée autorisée...".
     assert result.chart is None
-    assert "Aucune donnée autorisée" in result.answer
+    assert "Aucune donnée autorisée" not in result.answer
+    assert result.clarification["status"] == "need_more_information"
+    assert "valeurs" in result.answer
 
 
 async def test_search_database_denied_surfaces_as_access_denied(monkeypatch):
@@ -242,7 +264,7 @@ async def test_ambiguous_type_defaults_to_bar_when_data_is_resolvable(monkeypatc
     async def fake_call_tool(session, name, arguments):
         if name == "generate_chart":
             captured["arguments"] = arguments
-        return {"chart": {**arguments}} if name == "generate_chart" else {"results": [{"label": "Budget IT", "amount": 1.0, "year": 2025, "confidentiality": "CONFIDENTIAL"}]}
+        return {"chart": {**arguments}} if name == "generate_chart" else {"results": [{"label": "Budget IT", "amount": 1.0, "year": 2025, "confidentiality": "CONFIDENTIAL"}, {"label": "Budget RH", "amount": 2.0, "year": 2025, "confidentiality": "CONFIDENTIAL"}]}
 
     monkeypatch.setattr(orchestrator, "call_tool", fake_call_tool)
 

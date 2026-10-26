@@ -56,3 +56,14 @@ def test_subject_extraction_strips_trigger_words():
     r = detect_chart_intent("Fais un histogramme des ventes par produit.")
     assert "histogramme" not in r.subject.lower()
     assert "ventes" in r.subject.lower()
+
+
+def test_ordinary_words_like_evolution_are_not_chart_requests():
+    # seen live: a regulatory question turned into "Je peux créer ce graphique..."
+    assert detect_chart_intent("Quelles sont les dernières évolutions de la réglementation énergétique en Tunisie ?") is None
+    assert detect_chart_intent("Donne-moi les dernières évolutions de la réglementation") is None
+    assert detect_chart_intent("Quelle est la tendance du marché de l'énergie ?") is None
+    # ...but they still are with a visual verb, or an action on figures
+    assert detect_chart_intent("Montre l'évolution de la réglementation").chart_type == "line"
+    assert detect_chart_intent("Je veux l'évolution du budget IT").chart_type == "line"
+    assert detect_chart_intent("Une courbe de la réglementation").chart_type == "line"

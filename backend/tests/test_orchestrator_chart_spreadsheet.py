@@ -340,3 +340,44 @@ async def test_diagnostic_log_emitted_before_generate_chart(monkeypatch, caplog)
     assert "REQUESTED FILE" in messages
     assert "RESOLVED SHEET: CA mensuel" in messages
     assert "ROWS FOUND: 2" in messages
+
+
+async def test_exact_user_request_renders_twelve_ordered_months_with_readable_title(monkeypatch):
+    """The exact request from the bug report: a real chart (never Python
+    code, never the LLM), all 12 months in calendar order - even when the
+    sheet itself lists them out of order - values untouched, and a title
+    built from what is plotted instead of the stripped-down request text."""
+    _install_session(monkeypatch)
+    monkeypatch.setattr(orchestrator, "chat_completion", _fail_llm)
+    months = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+    values = [420000, 445000, 438000, 472000, 495000, 510000, 503000, 528000, 551000, 545000, 578000, 610000]
+    real_rows = [
+        {"Mois": m, "Chiffre d'affaires (TND)": v, "Commandes": 0, "Clients actifs": 0} for m, v in zip(months, values)
+    ]
+    shuffled = {**CA_MENSUEL, "rows": list(reversed(real_rows))}
+
+    async def fake_call_tool(session, name, arguments):
+        if name == "read_spreadsheet_data":
+            return shuffled
+        assert name == "generate_chart"
+        return {"chart": {**arguments}}
+
+    monkeypatch.setattr(orchestrator, "call_tool", fake_call_tool)
+
+    result = await orchestrator.run_agent_turn(
+        user_id="u1", grant=_grant(),
+        message=(
+            "À partir du fichier Orbitia_Test_Entreprise_Complet.xlsx, feuille CA mensuel, génère un graphique en "
+            "courbe du chiffre d'affaires de janvier à décembre. Utilise uniquement Mois pour l'axe X et Chiffre "
+            "d'affaires (TND) pour l'axe Y. N'invente aucune donnée."
+        ),
+        history=[],
+    )
+
+    chart = result.chart
+    assert chart["chart_type"] == "line"
+    assert chart["title"] == "Chiffre d'affaires — CA mensuel"
+    assert [row["Mois"] for row in chart["data"]] == months
+    assert [row["Chiffre d'affaires (TND)"] for row in chart["data"]] == values
+    assert all(isinstance(row["Chiffre d'affaires (TND)"], int) for row in chart["data"])
+    assert "```" not in result.answer and "matplotlib" not in result.answer
