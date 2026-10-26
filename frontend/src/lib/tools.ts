@@ -12,6 +12,10 @@ export const TOOL_LABELS: Record<string, string> = {
   analyze_image: 'Analyse de l’image (modèle vision)',
   web_search: 'Recherche sur Internet',
   find_document_amounts: 'Relevé des montants dans les documents',
+  email_list_recent: 'Derniers emails de la boîte (lecture seule)',
+  email_search: 'Recherche dans la boîte mail (lecture seule)',
+  email_get_message: 'Lecture d’emails (lecture seule)',
+  email_summarize_local: 'Résumé des emails par le modèle IA local',
 }
 
 export function toolLabel(name: string): string {

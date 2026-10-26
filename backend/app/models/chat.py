@@ -66,7 +66,13 @@ class Message(Base):
     # location and excerpt) - rendered by the frontend as a results panel.
     # NULL for every other answer.
     search_results: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    # direct | general | documents | web | hybrid | unavailable (NULL: older rows)
+    # Personal mailbox answer (app/agent/email_turn.py): account, facts copied
+    # from the provider and the local model's summaries - never a full email
+    # body. Expires at email_results_expires_at (retention.py replaces it and
+    # the answer text with a marker). NULL for every other answer.
+    email_results: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    email_results_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # direct | general | documents | web | hybrid | email | unavailable (NULL: older rows)
     answer_mode: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

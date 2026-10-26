@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "test": "node --experimental-strip-types --test tests/workspaceSyncPolicy.test.mjs tests/workspaceScanner.test.mjs tests/browserImport.test.mjs tests/reportRendering.test.mjs tests/chartContract.test.mjs tests/folderTree.test.mjs tests/webSearch.test.mjs tests/answerMode.test.mjs tests/whatsappPhone.test.mjs",
+    "test": "node --experimental-strip-types --test tests/workspaceSyncPolicy.test.mjs tests/workspaceScanner.test.mjs tests/browserImport.test.mjs tests/reportRendering.test.mjs tests/chartContract.test.mjs tests/folderTree.test.mjs tests/webSearch.test.mjs tests/answerMode.test.mjs tests/whatsappPhone.test.mjs tests/emailAccounts.test.mjs",
     "test:sync-policy": "node --experimental-strip-types --test tests/workspaceSyncPolicy.test.mjs tests/workspaceScanner.test.mjs tests/browserImport.test.mjs",
     "preview": "vite preview"
   },

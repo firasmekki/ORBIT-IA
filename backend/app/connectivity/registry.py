@@ -1,7 +1,7 @@
 """One public registry for connector status, tools and permission summaries."""
 
 from app.connectivity.email import public_config
-from app.connectivity.gmail import configured as gmail_configured
+from app.connectivity.email_accounts.service import provider_issues
 from app.websearch.config import load_config, make_provider
 from app.websearch.providers import PROVIDERS
 from app.websearch.service import last_status as web_last_status
@@ -10,8 +10,6 @@ from app.websearch.service import last_status as web_last_status
 FUTURE_CONNECTORS = [
     {"id": "whatsapp_business", "name": "WhatsApp Business Cloud API", "category": "Messagerie", "protocol": "Meta Graph API + webhook signé", "state": "development",
      "description": "Non activé : identifiants Meta, webhook signé, règles de conversation et coûts à configurer avant usage.", "tools": [], "permissions": []},
-    {"id": "microsoft_365", "name": "Microsoft 365", "category": "Email", "protocol": "OAuth 2.0 / Microsoft Graph", "state": "development",
-     "description": "Application Entra ID et consentement OAuth requis.", "tools": [], "permissions": []},
     {"id": "calendar", "name": "Calendrier", "category": "Planning", "protocol": "Google Calendar / Microsoft Graph", "state": "development",
      "description": "Recherche en lecture ; création après confirmation à développer.", "tools": [], "permissions": []},
     {"id": "storage", "name": "Stockage documentaire", "category": "Fichiers", "protocol": "Drive / OneDrive / SharePoint", "state": "development",
@@ -23,6 +21,29 @@ FUTURE_CONNECTORS = [
     {"id": "industrial", "name": "Outils industriels", "category": "Industrie", "protocol": "ORBIT API / MQTT / OPC UA", "state": "development",
      "description": "Connecteur industriel à développer.", "tools": [], "permissions": []},
 ]
+
+
+PERSONAL_MAILBOXES = [
+    ("google_gmail", "gmail", "Gmail / Google Workspace", "OAuth 2.0 / Gmail API", "gmail.readonly"),
+    ("microsoft_outlook", "outlook", "Outlook / Hotmail / Microsoft 365", "OAuth 2.0 / Microsoft Graph", "Mail.Read"),
+    ("yahoo_mail", "yahoo", "Yahoo Mail", "OAuth 2.0 / IMAP (OAUTHBEARER)", "mail-r"),
+]
+
+
+def _personal_mailbox(card_id: str, provider: str, name: str, protocol: str, scope: str) -> dict:
+    """Personal, per-user, read-only mailboxes (app/connectivity/email_accounts).
+    Yahoo is listed as in development until Yahoo grants the mail-r scope."""
+    ready = not provider_issues(provider)
+    if provider == "yahoo":
+        return {"id": card_id, "name": name, "category": "Email", "protocol": protocol, "state": "development",
+                "description": "Prévu, désactivé : l'accès développeur Yahoo (scope mail-r) doit d'abord être obtenu.",
+                "enabled": False, "provider": provider, "tools": [], "permissions": [], "configured": False,
+                "last_status": None}
+    return {"id": card_id, "name": name, "category": "Email", "protocol": protocol,
+            "description": "Compte personnel de chaque utilisateur, en lecture seule ; jamais d'envoi ni de modification.",
+            "state": "configured" if ready else "not_configured", "enabled": ready, "provider": provider,
+            "tools": ["email_list_recent", "email_search", "email_get_message", "email_summarize_local"] if ready else [],
+            "permissions": [f"{scope} (lecture seule)"] if ready else [], "configured": ready, "last_status": None}
 
 
 def list_connectors(db):
@@ -55,11 +76,7 @@ def list_connectors(db):
          "permissions": ([f"{tool}: {r}" for tool, roles in mail["tool_roles"].items() for r in roles]
                          + [f"envoi après confirmation: {r}" for r in mail["send_roles"]]),
          "configured": mail["state"] == "configured", "last_status": mail["last_status"]},
-        {"id": "google_gmail", "name": "Gmail / Google Workspace", "category": "Email", "protocol": "OAuth 2.0 / Gmail API",
-         "description": "Accès en lecture avec OAuth Google ; chaque utilisateur voit uniquement ses comptes Gmail.",
-         "state": "configured" if gmail_configured() else "not_configured", "enabled": gmail_configured(),
-         "provider": "gmail_api", "tools": ["gmail_search", "gmail_read", "gmail_read_thread"] if gmail_configured() else [],
-         "permissions": ["gmail.readonly"] if gmail_configured() else [], "configured": gmail_configured(), "last_status": None},
+        *(_personal_mailbox(*card) for card in PERSONAL_MAILBOXES),
         *FUTURE_CONNECTORS,
     ]
     return connectors

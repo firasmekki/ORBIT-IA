@@ -99,13 +99,37 @@ class Settings(BaseSettings):
     google_search_api_key: str = ""
     google_search_engine_id: str = ""
 
-    # Google Gmail OAuth. Callback must exactly match a URI registered in
-    # Google Cloud Console; credentials stay on the backend.
+    # Personal mailboxes, strictly read-only (app/connectivity/email_accounts).
+    # Every OAuth callback must exactly match a URI registered with the
+    # provider; client secrets and tokens never leave the backend.
     gmail_oauth_client_id: str = ""
     gmail_oauth_client_secret: str = ""
-    gmail_token_encryption_key: str = ""
     gmail_oauth_redirect_uri: str = "http://localhost:8081/api/connectivity/gmail/callback"
-    gmail_frontend_redirect_uri: str = "http://localhost:8081/connectivity"
+    # Legacy key of the first Gmail connector - only read to migrate the
+    # tokens it encrypted (app/connectivity/email_accounts/legacy.py).
+    gmail_token_encryption_key: str = ""
+    outlook_oauth_client_id: str = ""
+    outlook_oauth_client_secret: str = ""
+    outlook_oauth_redirect_uri: str = "http://localhost:8081/api/connectivity/outlook/callback"
+    # common (personal + work/school) | consumers | organizations | a tenant id
+    outlook_oauth_authority: str = "common"
+    # Yahoo stays off until Yahoo approves this app for the restricted mail-r
+    # scope; no app-password fallback is offered.
+    yahoo_mail_enabled: bool = False
+    # Fernet key(s) for tokens at rest, comma-separated: the first encrypts,
+    # all decrypt (rotation). Generate with Fernet.generate_key(); keep in .env.
+    email_token_encryption_key: str = ""
+    email_frontend_redirect_uri: str = "http://localhost:8081/connectivity"
+    email_default_limit: int = 10
+    email_max_limit: int = 25
+    email_max_summarize: int = 10
+    email_max_body_chars: int = 6000
+    email_provider_timeout_seconds: float = 20
+    # Email cards/summaries kept in the chat history this many days, then
+    # replaced by an "expired" marker (app/connectivity/email_accounts/retention.py).
+    email_results_retention_days: int = 30
+    # "Aujourd'hui" / "cette semaine" when the browser sends no time zone.
+    email_default_timezone: str = "UTC"
 
     # Embeddings for the RAG index - still served by Ollama (nomic-embed-text,
     # 768 dims). Qwen3 is a generation model, not an embedding model:

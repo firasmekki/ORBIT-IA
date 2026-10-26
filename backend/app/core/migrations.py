@@ -147,6 +147,17 @@ def bootstrap_schema(conn: Connection) -> None:
     # How the answer was produced (direct / general / documents / web /
     # hybrid / unavailable) - NULL for old rows (derived by the frontend).
     conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS answer_mode VARCHAR(16)"))
+    # Personal mailbox answers (app/agent/email_turn.py) and their retention
+    # (app/connectivity/email_accounts/retention.py). email_connections and
+    # email_oauth_states are new tables: created by create_all above.
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS email_results JSONB"))
+    conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS email_results_expires_at TIMESTAMPTZ"))
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_messages_email_results_expires_at ON messages (email_results_expires_at) "
+            "WHERE email_results_expires_at IS NOT NULL"
+        )
+    )
 
     # Soft-delete for "Supprimer l'historique" (routers/chat.py's
     # delete_history) - see Conversation.deleted_at's docstring. Every read

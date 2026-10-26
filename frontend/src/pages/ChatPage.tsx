@@ -13,6 +13,7 @@ import { useAuth } from '../context/AuthContext'
 import { ConfidentialityBadge, DecisionBadge } from '../components/Badges'
 import { ChartBlock } from '../components/ChartBlock'
 import { SearchResultsBlock } from '../components/SearchResultsBlock'
+import { EmailResultsBlock } from '../components/EmailResultsBlock'
 import { IconTrash } from '../components/Icons'
 import { WorkspacePicker } from '../components/WorkspacePicker'
 import { FolderScopePicker } from '../components/FolderScopePicker'
@@ -594,6 +595,8 @@ export function ChatPage() {
                   {msg.chart && <ChartBlock spec={msg.chart} onAsk={sending ? undefined : (text) => send(text)} />}
 
                   {msg.search_results && <SearchResultsBlock results={msg.search_results} />}
+
+                  {msg.email_results && <EmailResultsBlock results={msg.email_results} />}
 
                   {(msg.sources.length > 0 || msg.tool_trace.length > 0) && (
                     <div className="msg-meta">

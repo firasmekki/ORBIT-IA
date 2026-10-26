@@ -2986,3 +2986,45 @@ span.tree-toggle { cursor: default; }
   .connector-form-footer { flex-direction: column-reverse; align-items: stretch; padding: 12px 16px; }
   .connector-form-footer .btn { width: 100%; justify-content: center; }
 }
+
+/* --- Personal mailboxes: "Comptes email connectés" (EmailAccountsPanel) --- */
+.email-accounts { margin-bottom: 18px; display: grid; gap: 14px; }
+.email-accounts-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.email-accounts-header h2 { margin: 0 0 4px; }
+.email-accounts-header p { margin: 0; color: var(--text-muted); max-width: 760px; }
+.email-provider-buttons { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.email-provider { display: grid; gap: 4px; align-content: start; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-alt); }
+.email-account-list { display: grid; gap: 10px; }
+.email-account-row { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); }
+.email-account-main { display: grid; gap: 3px; min-width: 0; }
+.email-account-main strong { overflow-wrap: anywhere; }
+.email-account-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
+.email-accounts-help { margin: 0; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--accent-soft); }
+.connector-toggle-inline { display: inline-flex; align-items: center; gap: 6px; }
+
+/* --- Mailbox answer cards in the chat (EmailResultsBlock) --- */
+.email-results { margin-top: 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
+.email-results-expired { padding: 10px 14px; color: var(--text-muted); font-size: 13px; }
+.email-results-header { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; padding: 10px 14px; background: var(--surface-alt); border-bottom: 1px solid var(--border); }
+.email-results-account { font-weight: 700; overflow-wrap: anywhere; }
+.email-results-scope { font-size: 12.5px; color: var(--text-muted); }
+.email-results-readonly { margin-left: auto; font-size: 11.5px; color: var(--allow); background: var(--allow-bg); padding: 2px 8px; border-radius: 999px; }
+.email-report { display: grid; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.email-report-block h4 { margin: 0 0 4px; font-size: 13px; }
+.email-report-block p, .email-report-block ul { margin: 0; font-size: 13px; }
+.email-cards { list-style: none; margin: 0; padding: 0; }
+.email-card { display: grid; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+.email-card:last-child { border-bottom: none; }
+.email-card-subject { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.email-card-subject strong { overflow-wrap: anywhere; }
+.email-badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-strong); }
+.email-card-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12.5px; color: var(--text-muted); overflow-wrap: anywhere; }
+.email-card-attachments, .email-card-snippet, .email-card-note { margin: 0; font-size: 12.5px; color: var(--text-muted); overflow-wrap: anywhere; }
+.email-card-link { font-size: 12.5px; }
+.email-card-ai { padding: 8px 10px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: var(--radius-sm); font-size: 13.5px; }
+.email-card-ai p { margin: 4px 0; }
+.email-card-ai h5 { margin: 6px 0 2px; font-size: 12.5px; }
+.email-card-ai ul { margin: 0; padding-left: 18px; }
+.email-card-ai q { color: var(--text-muted); font-style: italic; }
+.email-card-ai-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; color: var(--accent-strong); }
+.email-results-notice { margin: 0; padding: 8px 14px; font-size: 12.5px; color: var(--warn); background: var(--warn-bg); }

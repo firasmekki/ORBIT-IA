@@ -118,6 +118,10 @@ class ChatRequest(BaseModel):
     # "folder": only the documents directly inside them; "all": every
     # workspace this user may use (document search only).
     scope_mode: Literal["folder", "recursive", "all"] = "recursive"
+    # The browser's IANA time zone ("Africa/Tunis"), so "aujourd'hui" /
+    # "cette semaine" in a mailbox question mean the user's own day.
+    # Validated server-side; an unknown value falls back to the default.
+    timezone: str | None = Field(default=None, max_length=64)
     # No "where to search" field: documents / web / both is decided by the
     # server for each question (app/websearch/intent.py). A field sent by an
     # older client is ignored (pydantic's default), it cannot force the web.
@@ -151,7 +155,11 @@ class MessageOut(BaseModel):
     # {"type": "keyword_search", "term", "total", "document_count",
     #  "workspace", "documents": [{..., "count", "occurrences": [...]}]}
     search_results: dict | None = None
-    # direct | general | documents | web | hybrid | unavailable (None: older messages)
+    # {"type": "email_results", "account", "query", "items": [{facts, ai,
+    #  deadlines, suggestions, status}], "report", "notices"} or
+    #  {"type": "email_results", "expired": true} - None otherwise.
+    email_results: dict | None = None
+    # direct | general | documents | web | hybrid | email | unavailable (None: older messages)
     answer_mode: str | None = None
     created_at: datetime
 
@@ -165,6 +173,8 @@ class MessageOut(BaseModel):
             source.excerpt = redact_secrets(source.excerpt)
         if self.search_results:
             self.search_results = redact_payload(self.search_results)
+        if self.email_results:
+            self.email_results = redact_payload(self.email_results)
         return self
 
     # User messages have NULL sources/tool_trace in the DB (nullable
