@@ -38,8 +38,9 @@ def test_unknown_and_future_connectors_are_never_reported_as_connected(db, make_
     assert cards["email_imap"]["configured"] is False
     assert cards["web_search"]["state"] in ("disabled", "not_configured")
     assert cards["google_gmail"]["state"] == "not_configured"
+    assert cards["microsoft_outlook"]["state"] == "not_configured"
+    assert cards["yahoo_mail"]["state"] == "development" and cards["yahoo_mail"]["enabled"] is False
     assert cards["whatsapp_business"]["state"] == "development"
-    assert cards["microsoft_365"]["state"] == "development"
     assert cards["calendar"]["tools"] == []
 
 
@@ -49,7 +50,7 @@ def test_personal_connectivity_overview_hides_admin_provider_settings(db, make_t
     response = client.get("/api/connectivity/overview")
     assert response.status_code == 200
     body = response.json()
-    assert {card["id"] for card in body["connectors"]} == {"google_gmail", "whatsapp_business"}
+    assert {card["id"] for card in body["connectors"]} == {"google_gmail", "microsoft_outlook", "yahoo_mail", "whatsapp_business"}
     assert body["email"]["imap_host"] == ""
     assert body["history"] == []
     assert client.get("/api/admin/connectivity").status_code == 403
