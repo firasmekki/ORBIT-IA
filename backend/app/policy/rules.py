@@ -12,10 +12,12 @@ architecture note explains how a Casbin/OPA policy-as-code engine is a
 drop-in replacement encoding the exact same rules for a production system.
 """
 
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from app.models.document import CONFIDENTIALITY_LEVELS, CONFIDENTIALITY_RANK
+from app.models.workspace import DEFAULT_WORKSPACE_ID
 
 if TYPE_CHECKING:
     from app.models.user import User
@@ -37,6 +39,7 @@ ALL_TOOLS: frozenset[str] = frozenset(
         "search_database",
         "get_company_information",
         "search_keyword",
+        "search_document_text",
         "list_documents",
         "get_document_section",
         "generate_chart",
@@ -49,6 +52,8 @@ _BASE_TOOLS = {
     "get_document",
     "get_company_information",
     "search_keyword",
+    # Exact text search (count/occurrences) - same scope as search_keyword.
+    "search_document_text",
     "list_documents",
     "get_document_section",
     # Available to every role: generate_chart never fetches data itself
@@ -61,6 +66,19 @@ _BASE_TOOLS = {
     # just another way of reading an authorized document's content) - no
     # extra role restriction on top.
     "read_spreadsheet_data",
+}
+
+# role -> departments in which it may read OTHER employees' personal
+# documents (Document.subject_user_id set), still capped by max_level.
+# Everyone always reads their own; a developer or an employee never reads a
+# colleague's payslip, leave record or task list through their role -
+# only through an explicit Director rule (DocumentAccessRule).
+PERSONAL_DOC_READERS: dict[str, set[str]] = {
+    "DIRECTOR": {"HR", "FINANCE", "TECH", "GENERAL", "EXEC"},
+    "HR": {"HR"},
+    "ACCOUNTANT": {"FINANCE"},
+    "DEVELOPER": set(),
+    "EMPLOYEE": set(),
 }
 
 # role -> MCP tools it is even allowed to invoke. A tool absent from a
@@ -83,6 +101,40 @@ class Grant:
     max_level: str
     max_level_rank: int
     tools: frozenset[str]
+    # The workspace this grant is evaluated in. Set ONLY by the server after
+    # checking the user may use that workspace (app/policy/workspace.py) -
+    # never from LLM or request input as such. Every document query adds
+    # "workspace_id = this" to the RBAC/ABAC filter (engine.document_scope).
+    workspace_id: uuid.UUID = DEFAULT_WORKSPACE_ID
+    # Whose grant this is (personal documents: Document.subject_user_id).
+    user_id: uuid.UUID | None = None
+    # Departments whose personal documents of OTHER users this role may read.
+    personal_departments: frozenset[str] = frozenset()
+    # A Director's explicit exceptions for this user in `workspace_id`, loaded
+    # by policy.workspace.grant_in_workspace (DocumentAccessRule). Folders end
+    # with "/". A deny always wins over everything else.
+    allowed_document_ids: frozenset[uuid.UUID] = frozenset()
+    denied_document_ids: frozenset[uuid.UUID] = frozenset()
+    allowed_folders: frozenset[str] = frozenset()
+    denied_folders: frozenset[str] = frozenset()
+    # Folders of `workspace_id` shared "like Dropbox" (RestrictedFolder): their
+    # documents are visible only through an allow rule (or to their subject)
+    # - unless this user is the Director or the workspace owner.
+    restricted_folders: frozenset[str] = frozenset()
+    bypass_restrictions: bool = False
+    # False when this user is in the workspace ONLY because a folder or a
+    # file of it was shared with them (Dropbox-like): they then see what
+    # was shared, and their own personal documents - nothing by role.
+    role_scope: bool = True
+    # The sub-folders of the workspace the user chose to work in for this
+    # turn ("BIC/", "Delice CLN/"), each ending with "/". Empty = the whole
+    # workspace. It only ever NARROWS what the grant shows - a convenience
+    # filter on top of every rule above, never a permission.
+    folder_scope: frozenset[str] = frozenset()
+    # "recursive": the chosen folders and everything under them (default).
+    # "direct": only the documents directly inside them - with no folder
+    # chosen, only the documents at the root of the workspace.
+    folder_depth: str = "recursive"
 
 
 def resolve_grant(role: str) -> Grant | None:
@@ -95,6 +147,7 @@ def resolve_grant(role: str) -> Grant | None:
         max_level=rules["max_level"],
         max_level_rank=CONFIDENTIALITY_RANK[rules["max_level"]],
         tools=frozenset(ROLE_TOOLS.get(role, set())),
+        personal_departments=frozenset(PERSONAL_DOC_READERS.get(role, set())),
     )
 
 
@@ -135,4 +188,6 @@ def resolve_effective_grant(user: "User") -> Grant | None:
         max_level=max_level,
         max_level_rank=max_level_rank,
         tools=frozenset(tools),
+        user_id=user.id,
+        personal_departments=base.personal_departments,
     )

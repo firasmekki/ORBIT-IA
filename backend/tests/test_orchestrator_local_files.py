@@ -172,7 +172,7 @@ async def test_resume_unsupported_file_type_returns_clean_error(monkeypatch):
     assert "pas encore pris en charge" in result.answer
 
 
-async def test_resume_llm_unavailable_falls_back_to_raw_excerpt(monkeypatch):
+async def test_resume_llm_unavailable_never_shows_the_raw_file_content(monkeypatch):
     monkeypatch.setattr(orchestrator, "open_mcp_session", _fail_mcp)
 
     async def failing_llm(messages, tools=None):
@@ -190,4 +190,7 @@ async def test_resume_llm_unavailable_falls_back_to_raw_excerpt(monkeypatch):
     )
 
     assert result.degraded is True
-    assert "Contenu important des notes." in result.answer
+    # model down: a plain availability message - the file content is never
+    # returned in place of an answer (it could hold anything, credentials too)
+    assert "Contenu important des notes." not in result.answer
+    assert "Aucun contenu de document n'est affiché" in result.answer

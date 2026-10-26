@@ -15,7 +15,7 @@ actual text extraction once the client has supplied the bytes.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.rag.normalize import normalize
 
@@ -99,3 +99,88 @@ def is_safe_relative_path(relative_path: str) -> bool:
     normalized = relative_path.replace("\\", "/")
     parts = normalized.split("/")
     return not any(part in ("..", ".") for part in parts)
+
+
+# --- searching the Workspace's content ---------------------------------------------
+#
+# "recherche Tarek" with a Workspace selected: the term may only exist in the
+# user's own files (a CV, a report), which the backend cannot read. The agent
+# asks the browser - the only party holding the FileSystemDirectoryHandle - to
+# read the searchable files of the index it already sent, then searches them
+# here with the very same exact matcher as company documents
+# (app/rag/search_keyword.py) after the very same text extraction
+# (app/rag/extract.py). Nothing is stored; every read is audited
+# (routers/chat.py). No department/confidentiality ACL: these are the
+# user's own files, the trust boundary is the user (see module docstring).
+
+
+SEARCHABLE_EXTENSIONS = {"txt", "md", "pdf", "docx", "xlsx", "pptx"}
+MAX_SEARCH_FILES = 40
+MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024
+MAX_SEARCH_TOTAL_BYTES = 15 * 1024 * 1024  # stays under the proxy's 25 MB body cap once base64-encoded
+MAX_EXCERPTS_PER_FILE = 3
+
+
+def select_searchable_files(index: list) -> tuple[list, list[dict]]:
+    """(files to read, [{"name", "reason"}] skipped) - in index order,
+    within the per-file and total size budgets."""
+    selected: list = []
+    skipped: list[dict] = []
+    total = 0
+    for entry in index:
+        if (entry.extension or "").lower() not in SEARCHABLE_EXTENSIONS:
+            continue
+        if not is_safe_relative_path(entry.relative_path):
+            continue
+        size = entry.size or 0
+        if size > MAX_SEARCH_FILE_BYTES:
+            skipped.append({"name": entry.name, "reason": "fichier trop volumineux"})
+        elif len(selected) >= MAX_SEARCH_FILES or total + size > MAX_SEARCH_TOTAL_BYTES:
+            skipped.append({"name": entry.name, "reason": "limite de la recherche atteinte"})
+        else:
+            selected.append(entry)
+            total += size
+    return selected, skipped
+
+
+@dataclass
+class LocalFileHit:
+    name: str
+    relative_path: str
+    count: int
+    excerpts: list[tuple[int, str]] = field(default_factory=list)  # (line, excerpt)
+
+
+def search_local_files(term: str, files: list[tuple[str, str, bytes]]) -> tuple[list[LocalFileHit], list[dict]]:
+    """Exact, case/accent-insensitive whole-word search of `term` in each
+    (name, relative_path, content) file. Returns (hits sorted by count,
+    [{"name", "reason"}] files that could not be read)."""
+    from app.rag.extract import ExtractionError, UnsupportedFileTypeError, extract
+    from app.rag.search_keyword import build_pattern, find_matches
+
+    pattern = build_pattern(term, whole_word=True)
+    if pattern is None:
+        return [], []
+    hits: list[LocalFileHit] = []
+    unreadable: list[dict] = []
+    for name, relative_path, content in files:
+        try:
+            text = extract(name, content).text
+        except (UnsupportedFileTypeError, ExtractionError) as exc:
+            unreadable.append({"name": name, "reason": str(exc)[:120]})
+            continue
+        except Exception:  # noqa: BLE001 - a corrupt file must not fail the whole search
+            unreadable.append({"name": name, "reason": "fichier illisible"})
+            continue
+        matches = find_matches(text, 1, pattern)
+        if matches:
+            hits.append(
+                LocalFileHit(
+                    name=name,
+                    relative_path=relative_path,
+                    count=len(matches),
+                    excerpts=[(m.line, m.excerpt) for m in matches[:MAX_EXCERPTS_PER_FILE]],
+                )
+            )
+    hits.sort(key=lambda h: h.count, reverse=True)
+    return hits, unreadable

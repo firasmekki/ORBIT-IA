@@ -47,14 +47,35 @@ def test_format_keyword_result_with_matches():
             }
         ],
     }
-    text = orchestrator._format_keyword_result(result)
-    assert "firas" in text
-    assert "2 fois" in text
-    assert "p.1, l.3" in text
-    assert "Bloc 2, l.14" in text
+    text = orchestrator._format_keyword_result(result, "orbitaitest")
+    assert text == "« firas » apparaît 2 fois dans 1 document de l'espace de travail « orbitaitest ».\nFichier : CV."
+
+    # The detail (location, line, excerpt) goes to the structured panel.
+    panel = orchestrator._search_results_payload(result | {"documents": [result["documents"][0] | {
+        "document_id": "d1", "department": "GENERAL", "confidentiality": "INTERNAL"}]}, "orbitaitest")
+    assert panel["total"] == 2 and panel["document_count"] == 1 and panel["workspace"] == "orbitaitest"
+    assert panel["documents"][0]["occurrences"] == [
+        {"page": 1, "section": None, "line": 3, "excerpt": "...Firas Mekki..."},
+        {"page": None, "section": "Bloc 2", "line": 14, "excerpt": "...Firas encore..."},
+    ]
 
 
-async def test_run_search_keyword_appends_deny_trace_and_hides_department(monkeypatch):
+def test_summary_names_the_document_with_most_occurrences():
+    docs = [
+        {"title": "export.csv", "relative_path": "data/export.csv", "count": 170, "locations": []},
+        {"title": "CV", "count": 1, "locations": []},
+    ]
+    text = orchestrator._format_keyword_result({"keyword": "intelligence", "total_count": 171, "documents": docs})
+    assert text == "« intelligence » apparaît 171 fois dans 2 documents.\nLe plus de résultats : data/export.csv (170 occurrences)."
+
+
+async def test_restricted_keyword_match_is_invisible_to_the_user(monkeypatch):
+    """A term present only in a document the user may not read: answer AND
+    visible trace are exactly those of a genuine "no occurrence" - for an
+    exact term, even "it exists somewhere" is a leak. The Director alert is
+    raised by the MCP tool itself (alert_raised, see
+    tests/test_term_search_acl.py)."""
+
     async def fake_call_tool(session, name, arguments):
         return {
             "keyword": "salaire",
@@ -62,6 +83,7 @@ async def test_run_search_keyword_appends_deny_trace_and_hides_department(monkey
             "total_count": 0,
             "documents": [],
             "restricted_match": {"department": "FINANCE", "confidentiality": "SECRET"},
+            "alert_raised": True,
         }
 
     monkeypatch.setattr(orchestrator, "call_tool", fake_call_tool)
@@ -69,14 +91,11 @@ async def test_run_search_keyword_appends_deny_trace_and_hides_department(monkey
     tool_trace: list[dict] = []
     result = await orchestrator._run_search_keyword(None, "salaire", True, tool_trace)
 
-    assert "FINANCE" not in result.answer
-    assert "SECRET" not in result.answer
     assert result.answer == "Aucune occurrence de « salaire » trouvée dans les documents auxquels vous avez accès."
-
-    assert len(tool_trace) == 2
-    assert tool_trace[0]["decision"] == "ALLOW"
-    assert tool_trace[1]["decision"] == "DENY"
-    assert "FINANCE" in tool_trace[1]["reason"]
+    assert tool_trace == [
+        {"tool": "search_keyword", "arguments": {"keyword": "salaire", "whole_word": True}, "decision": "ALLOW", "reason": "ok"}
+    ]
+    assert "FINANCE" not in str(result) and "SECRET" not in str(result)
 
 
 async def test_run_search_keyword_never_calls_llm(monkeypatch):

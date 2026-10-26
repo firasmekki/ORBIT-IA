@@ -1,9 +1,11 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.document import Document, DocumentChunk, DocumentPage
-from app.rag.embeddings import embed_text
+from app.rag.embeddings import embed_texts
 from app.rag.extract import ExtractedPage
 
 CHUNK_SIZE = 800
@@ -86,7 +88,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     return verified
 
 
-def _page_ranges(pages: list[ExtractedPage]) -> list[tuple[int, int]]:
+def _page_ranges(pages: list) -> list[tuple[int, int]]:
     """Character range each page occupies within the flattened text - exact
     by construction, since app.rag.extract._assemble() builds that flattened
     text as exactly "\\n\\n".join(page.text for page in pages)."""
@@ -100,7 +102,7 @@ def _page_ranges(pages: list[ExtractedPage]) -> list[tuple[int, int]]:
     return ranges
 
 
-def _page_id_for_chunk(chunk: TextChunk, page_ranges: list[tuple[int, int]], page_rows: list[DocumentPage]):
+def _page_id_for_chunk(chunk: TextChunk, page_ranges: list[tuple[int, int]], page_rows: list):
     """A chunk that straddles two pages is attributed to the page containing
     its FIRST character - a definite, documented rule (not an average or a
     guess). Returns None if the chunk's position is unknown."""
@@ -112,18 +114,22 @@ def _page_id_for_chunk(chunk: TextChunk, page_ranges: list[tuple[int, int]], pag
     return None
 
 
-def ingest_document(db: Session, document: Document, pages: list[ExtractedPage] | None = None) -> int:
-    """Chunk, embed and (re)index a document. Returns the number of chunks written.
+EMBED_BATCH_SIZE = 64
 
-    Also (re)writes app.models.document.DocumentPage rows used by
-    search_keyword / get_document_section, and links each DocumentChunk to
-    the page/section it falls within (search_documents' page/section
-    fields) via DocumentChunk.document_page_id. `pages` comes from
-    app.rag.extract for real file uploads; documents created by hand
-    (DocumentCreate, no source file) pass None and get a single synthetic
-    page covering the whole content, so every document is always
-    keyword-searchable regardless of how it was created.
-    """
+
+@dataclass(frozen=True)
+class _PageRef:
+    id: object
+    text: str
+
+
+def write_pages(db: Session, document: Document, pages: list[ExtractedPage] | None = None) -> list[DocumentPage]:
+    """Phase 1 - instant: (re)writes the document's DocumentPage rows (and
+    drops its old chunks). From this commit on, the document is fully
+    readable and exact-searchable (search_keyword / search_document_text /
+    get_document_section work on pages), whatever its size. `pages` comes
+    from app.rag.extract for real files; None (hand-typed documents) gives
+    one synthetic page covering the whole content."""
     db.query(DocumentChunk).filter(DocumentChunk.document_id == document.id).delete()
     db.query(DocumentPage).filter(DocumentPage.document_id == document.id).delete()
 
@@ -140,22 +146,71 @@ def ingest_document(db: Session, document: Document, pages: list[ExtractedPage] 
         )
         db.add(row)
         page_rows.append(row)
-    db.flush()  # need page_rows[i].id populated before chunks can reference them
-
-    page_ranges = _page_ranges(effective_pages)
-
-    chunks = chunk_text(document.content)
-    for index, chunk in enumerate(chunks):
-        embedding = embed_text(chunk.text)
-        db.add(
-            DocumentChunk(
-                document_id=document.id,
-                chunk_index=index,
-                chunk_text=chunk.text,
-                embedding=embedding,
-                document_page_id=_page_id_for_chunk(chunk, page_ranges, page_rows),
-            )
-        )
-
     db.commit()
+    return page_rows
+
+
+def embed_document(
+    db: Session,
+    document: Document,
+    *,
+    batch_size: int = EMBED_BATCH_SIZE,
+    on_progress: Callable[[int, int], None] | None = None,
+    still_wanted: Callable[[], bool] | None = None,
+) -> int:
+    """Phase 2 - the slow part, the one only semantic search needs: chunks
+    the content, embeds the chunks in batches and links each chunk to the
+    page it starts in. Commits after every batch, so semantic search covers
+    a large document progressively. Returns the number of chunks, or -1 if
+    `still_wanted()` said to stop (the file changed again meanwhile)."""
+    # Plain values, not ORM rows: if the file is re-synced meanwhile, its
+    # pages are replaced by another session and these rows would vanish.
+    page_refs = [
+        _PageRef(id=row.id, text=row.text)
+        for row in db.query(DocumentPage)
+        .filter(DocumentPage.document_id == document.id)
+        .order_by(DocumentPage.order_index)
+    ]
+    # Same character ranges as when the pages were built: the flattened
+    # content is "\n\n".join(page texts) by construction (app.rag.extract).
+    page_ranges = _page_ranges(page_refs)
+    content = document.content
+    db.query(DocumentChunk).filter(DocumentChunk.document_id == document.id).delete()
+    db.commit()
+
+    chunks = chunk_text(content)
+    for first in range(0, len(chunks), batch_size):
+        if still_wanted is not None and not still_wanted():
+            return -1
+        batch = chunks[first : first + batch_size]
+        vectors = embed_texts([chunk.text for chunk in batch])
+        # Checked again: the content may have changed during the (slow) call.
+        if still_wanted is not None and not still_wanted():
+            return -1
+        for index, (chunk, embedding) in enumerate(zip(batch, vectors), start=first):
+            db.add(
+                DocumentChunk(
+                    document_id=document.id,
+                    chunk_index=index,
+                    chunk_text=chunk.text,
+                    embedding=embedding,
+                    document_page_id=_page_id_for_chunk(chunk, page_ranges, page_refs),
+                )
+            )
+        try:
+            db.commit()
+        except IntegrityError:
+            # Its pages were replaced between the check and the commit: the
+            # new version is queued again and will be embedded from scratch.
+            db.rollback()
+            return -1
+        if on_progress is not None:
+            on_progress(min(first + batch_size, len(chunks)), len(chunks))
     return len(chunks)
+
+
+def ingest_document(db: Session, document: Document, pages: list[ExtractedPage] | None = None) -> int:
+    """Both phases, synchronously (manual uploads, seed, watched folder).
+    Returns the number of chunks written."""
+    write_pages(db, document, pages)
+    return embed_document(db, document)

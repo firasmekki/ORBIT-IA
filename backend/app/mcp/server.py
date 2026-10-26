@@ -15,31 +15,48 @@ from the internal token's payload - a Director's per-user access grant (or
 revocation) takes effect on the very next tool call, no new token needed.
 """
 
+import dataclasses
+import logging
 import re
 import uuid
+from functools import partial
 from datetime import datetime, timedelta
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
 from sqlalchemy import func, or_, true
 
-from app.agent.chart import ChartValidationError, validate_chart_spec
-from app.core.alert_service import create_alert
+from app.agent.chart import ChartValidationError, read_sheet_rows, resolve_sheet_name, validate_chart_spec
+from app.core.alert_service import create_alert, security_event_key
 from app.core.audit_logger import log_event
 from app.core.database import SessionLocal
 from app.core.storage import download_file
-from app.mcp.context import IdentityError, extract_identity
+from app.mcp.context import IdentityError, IdentityExpired, extract_identity
 from app.models.document import Document, DocumentPage
 from app.models.finance import FinancialRecord
 from app.models.user import User
-from app.policy.engine import check_document_access, check_tool_access, retrieval_scope
+from app.policy.engine import (
+    ACCESS_DENIED,
+    AMBIGUOUS,
+    NOT_FOUND,
+    SERVICE_UNAVAILABLE,
+    VALIDATION_ERROR,
+    check_document_access,
+    check_document_in_scope,
+    check_tool_access,
+    document_scope,
+    outside_document_scope,
+    retrieval_scope,
+    tool_error,
+)
 from app.policy.rules import Grant, resolve_effective_grant
+from app.policy.workspace import WorkspaceAccessError, grant_in_workspace, resolve_workspace
 from app.rag.embeddings import EmbeddingServiceError
 from app.rag.normalize import normalize
 from app.rag.retriever import retrieve_with_out_of_scope_signal
-from app.rag.search_keyword import build_pattern, find_matches, is_arabic_keyword
+from app.services import text_search
+from app.services.errors import ServiceError
 
-MAX_LOCATIONS_PER_DOCUMENT = 5
 MAX_LIST_RESULTS = 200
 MAX_SECTION_CHARS = 2000
 MAX_TITLE_CHOICES = 10
@@ -65,14 +82,52 @@ mcp_app = FastMCP(
 )
 
 
-def _load_user_and_grant(db, user_id: str) -> tuple[User | None, Grant | None]:
+def _load_user_and_grant(
+    db, user_id: str, workspace_id: str | None = None, folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive"
+) -> tuple[User | None, Grant | None]:
+    """The caller and their RBAC/ABAC grant, evaluated inside the workspace
+    named by the signed internal token - re-checked here (defense in depth:
+    the backend already checked it before minting the token). A workspace
+    the user may not use yields no grant at all, so every tool refuses."""
     try:
         user = db.get(User, uuid.UUID(user_id))
     except ValueError:
         return None, None
     if user is None or not user.is_active:
         return None, None
-    return user, resolve_effective_grant(user)
+    grant = resolve_effective_grant(user)
+    if grant is None:
+        return user, None
+    try:
+        workspace = resolve_workspace(db, user, workspace_id)
+    except WorkspaceAccessError:
+        return user, None
+    scoped = grant_in_workspace(grant, workspace, db)
+    # Signed into the token by the backend; only ever narrows the grant.
+    if folder_scope:
+        scoped = dataclasses.replace(scoped, folder_scope=frozenset(folder_scope))
+    if folder_depth == "direct":
+        scoped = dataclasses.replace(scoped, folder_depth="direct")
+    return user, scoped
+
+
+def _identity_error(exc: IdentityError) -> dict:
+    """A forged/missing identity is refused (ACCESS_DENIED - a security
+    event); an expired one is a technical timeout (SERVICE_UNAVAILABLE): a
+    long report outliving its token must not raise a false security alert."""
+    if isinstance(exc, IdentityExpired):
+        return tool_error(SERVICE_UNAVAILABLE, str(exc))
+    return tool_error(ACCESS_DENIED, str(exc))
+
+
+def _document_names(doc: Document) -> list[str]:
+    """Every name a user may call a document by: its title, its original
+    filename, and - for a synced workspace file - its relative path and the
+    bare file name ("RH/procedure.docx" and "procedure.docx")."""
+    names = [doc.title, doc.source_filename or ""]
+    if doc.relative_path:
+        names += [doc.relative_path, doc.relative_path.rsplit("/", 1)[-1]]
+    return [normalize(n) for n in names if n]
 
 
 def _audit(db, *, user: User | None, role: str | None, action: str, decision: str, **kwargs) -> None:
@@ -89,14 +144,14 @@ def _audit(db, *, user: User | None, role: str | None, action: str, decision: st
 # --- sync implementations (run off the event loop via anyio.to_thread) -----
 
 
-def _search_documents_impl(user_id: str, query: str, top_k: int) -> dict:
+def _search_documents_impl(user_id: str, query: str, top_k: int, *, workspace_id: str | None = None, folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive") -> dict:
     db = SessionLocal()
     try:
-        user, grant = _load_user_and_grant(db, user_id)
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
         decision = check_tool_access(grant=grant, tool_name="search_documents")
         if not decision.allowed:
             _audit(db, user=user, role=grant.role if grant else None, action="MCP_SEARCH_DOCUMENTS", decision="DENY", reason=decision.reason)
-            return {"error": decision.reason}
+            return tool_error(ACCESS_DENIED, decision.reason)
 
         try:
             results, out_of_scope_hint = retrieve_with_out_of_scope_signal(
@@ -113,7 +168,7 @@ def _search_documents_impl(user_id: str, query: str, top_k: int) -> dict:
                 decision="DENY",
                 reason=f"service unavailable: {exc}",
             )
-            return {"error": str(exc), "service_unavailable": True}
+            return tool_error(SERVICE_UNAVAILABLE, str(exc), service_unavailable=True)
 
         _audit(
             db,
@@ -129,6 +184,7 @@ def _search_documents_impl(user_id: str, query: str, top_k: int) -> dict:
                 {
                     "document_id": str(r["document_id"]),
                     "title": r["title"],
+                    "relative_path": r.get("relative_path"),
                     "department": r["department"],
                     "confidentiality": r["confidentiality"],
                     "excerpt": r["chunk_text"][:600],
@@ -157,19 +213,72 @@ def _search_documents_impl(user_id: str, query: str, top_k: int) -> dict:
         db.close()
 
 
-def _get_document_impl(user_id: str, document_id: str) -> dict:
+# Pages worth reading for amounts: a budget/amount/cost word AND a currency.
+_AMOUNT_PAGE_KEYWORDS = r"(budget|montant|co[uû]t|enveloppe|estimati)"
+_AMOUNT_PAGE_CURRENCY = r"([0-9] ?(€|eur|dt|tnd|dinar|mdt|kdt))"
+MAX_AMOUNT_PAGES = 5000
+
+
+def _find_document_amounts_impl(user_id: str, *, workspace_id: str | None = None, folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive") -> dict:
+    """Server-side scan of the scope (document_scope: ACL + workspace +
+    folders + depth, applied in the SQL before any row is read). Same
+    right as search_documents - it reads the same authorized documents.
+    Raises no alert: it is not a user's term search."""
+    from app.agent.document_metrics import extract_amounts  # noqa: PLC0415 - shared deterministic extractor
+
     db = SessionLocal()
     try:
-        user, grant = _load_user_and_grant(db, user_id)
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
+        decision = check_tool_access(grant=grant, tool_name="search_documents")
+        if not decision.allowed:
+            _audit(db, user=user, role=grant.role if grant else None, action="MCP_FIND_DOCUMENT_AMOUNTS", decision="DENY", reason=decision.reason)
+            return tool_error(ACCESS_DENIED, decision.reason)
+        documents_in_scope = db.query(func.count(Document.id)).filter(*document_scope(grant)).scalar()
+        rows = (
+            db.query(Document.id, Document.title, Document.relative_path, DocumentPage.page_no, DocumentPage.section, DocumentPage.text)
+            .join(DocumentPage, DocumentPage.document_id == Document.id)
+            .filter(*document_scope(grant))
+            .filter(DocumentPage.text.op("~*")(_AMOUNT_PAGE_KEYWORDS), DocumentPage.text.op("~*")(_AMOUNT_PAGE_CURRENCY))
+            .order_by(Document.relative_path, DocumentPage.order_index)
+            .limit(MAX_AMOUNT_PAGES)
+            .all()
+        )
+        mentions, documents_with_amounts = [], set()
+        for doc_id, title, path, page_no, section, text_ in rows:
+            for m in extract_amounts(text_ or ""):
+                documents_with_amounts.add(doc_id)
+                mentions.append({
+                    "document_id": str(doc_id), "title": title, "relative_path": path, "page": page_no,
+                    "section": section, "value": m.value, "currency": m.currency, "year": m.year, "sentence": m.sentence,
+                })
+        _audit(
+            db, user=user, role=grant.role, action="MCP_FIND_DOCUMENT_AMOUNTS", decision="ALLOW", reason="ok",
+            extra={"documents_in_scope": documents_in_scope, "pages_read": len(rows), "mentions": len(mentions)},
+        )
+        return {
+            "documents_in_scope": documents_in_scope,
+            "pages_read": len(rows),
+            "pages_truncated": len(rows) >= MAX_AMOUNT_PAGES,
+            "documents_with_amounts": len(documents_with_amounts),
+            "mentions": mentions,
+        }
+    finally:
+        db.close()
+
+
+def _get_document_impl(user_id: str, document_id: str, *, workspace_id: str | None = None, folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive") -> dict:
+    db = SessionLocal()
+    try:
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
         tool_decision = check_tool_access(grant=grant, tool_name="get_document")
         if not tool_decision.allowed:
             _audit(db, user=user, role=grant.role if grant else None, action="MCP_GET_DOCUMENT", decision="DENY", reason=tool_decision.reason)
-            return {"error": tool_decision.reason}
+            return tool_error(ACCESS_DENIED, tool_decision.reason)
 
         try:
             doc_uuid = uuid.UUID(document_id)
         except ValueError:
-            return {"error": "identifiant de document invalide"}
+            return tool_error(VALIDATION_ERROR, "identifiant de document invalide")
 
         doc = db.get(Document, doc_uuid)
         if doc is None:
@@ -182,9 +291,9 @@ def _get_document_impl(user_id: str, document_id: str) -> dict:
                 resource_id=document_id,
                 reason="document not found",
             )
-            return {"error": "document introuvable"}
+            return tool_error(NOT_FOUND, DOCUMENT_NOT_FOUND_OR_DENIED, concealed=True)
 
-        decision = check_document_access(grant=grant, department=doc.department, confidentiality=doc.confidentiality)
+        decision = check_document_in_scope(grant=grant, document=doc)
         _audit(
             db,
             user=user,
@@ -197,138 +306,134 @@ def _get_document_impl(user_id: str, document_id: str) -> dict:
             extra={"title": doc.title, "department": doc.department, "confidentiality": doc.confidentiality},
         )
         if not decision.allowed:
-            return {"error": f"Accès refusé : {decision.reason}"}
+            code = NOT_FOUND if decision.out_of_context else ACCESS_DENIED
+            return tool_error(code, DOCUMENT_NOT_FOUND_OR_DENIED, concealed=True)
 
+        pages = (
+            db.query(DocumentPage.page_no, DocumentPage.section, DocumentPage.text)
+            .filter(DocumentPage.document_id == doc.id)
+            .order_by(DocumentPage.order_index)
+            .all()
+        )
         return {
             "document_id": str(doc.id),
             "title": doc.title,
+            "relative_path": doc.relative_path,
             "department": doc.department,
             "confidentiality": doc.confidentiality,
             "content": doc.content,
+            # Same text, split as extracted (PDF page / sheet / heading):
+            # lets a report cite "p. 4" instead of guessing.
+            "pages": [{"page": p.page_no, "section": p.section, "text": p.text} for p in pages],
+            "status": doc.status,
         }
     finally:
         db.close()
 
 
-def _search_keyword_impl(user_id: str, keyword: str, whole_word: bool) -> dict:
+def _list_folders_impl(user_id: str, *, workspace_id: str | None = None, folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive") -> dict:
+    """The folders of the workspace holding documents this caller may read,
+    with their document count - names only, the same visibility filter as
+    every other tool (document_scope). Lets the assistant understand "dans
+    le dossier noveau consultation" without guessing a path."""
     db = SessionLocal()
     try:
-        user, grant = _load_user_and_grant(db, user_id)
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
+        decision = check_tool_access(grant=grant, tool_name="list_documents")
+        if not decision.allowed:
+            _audit(db, user=user, role=grant.role if grant else None, action="MCP_LIST_FOLDERS", decision="DENY", reason=decision.reason)
+            return tool_error(ACCESS_DENIED, decision.reason)
+        counts: dict[str, int] = {}
+        total = 0
+        for (path,) in db.query(Document.relative_path).filter(*document_scope(grant)):
+            total += 1
+            parts = (path or "").split("/")[:-1]
+            for depth in range(1, len(parts) + 1):
+                folder = "/".join(parts[:depth]) + "/"
+                counts[folder] = counts.get(folder, 0) + 1
+        _audit(db, user=user, role=grant.role, action="MCP_LIST_FOLDERS", decision="ALLOW", reason="ok",
+               extra={"folders": len(counts)})
+        return {"folders": [{"path": p, "document_count": c} for p, c in sorted(counts.items())], "document_count": total}
+    finally:
+        db.close()
+
+
+def _search_document_text_impl(
+    user_id: str, query: str, case_sensitive: bool, whole_word: bool, count_only: bool,
+    *,
+    workspace_id: str | None = None,
+    folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive",
+) -> dict:
+    """Exact text search (app/services/text_search.py). The result carries
+    NO trace of documents outside the caller's grant - not even that some
+    exist: the out-of-scope probe only feeds the audit row and a Director
+    alert raised inside the service."""
+    db = SessionLocal()
+    try:
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
+        decision = check_tool_access(grant=grant, tool_name="search_document_text")
+        if not decision.allowed:
+            _audit(db, user=user, role=grant.role if grant else None, action="DOCUMENT_TEXT_SEARCH", decision="DENY", reason=decision.reason)
+            return tool_error(ACCESS_DENIED, decision.reason)
+        try:
+            result, _hint = text_search.search_document_text(
+                db, user, grant, query, case_sensitive=case_sensitive, whole_word=whole_word, count_only=count_only
+            )
+        except ServiceError as exc:
+            return exc.as_tool_error()
+        except Exception as exc:  # noqa: BLE001 - infrastructure, never a permission decision
+            _audit(db, user=user, role=grant.role, action="DOCUMENT_TEXT_SEARCH", decision="ERROR", reason=f"service unavailable: {exc}")
+            return tool_error(SERVICE_UNAVAILABLE, str(exc), service_unavailable=True)
+        return result
+    finally:
+        db.close()
+
+
+def _search_keyword_impl(user_id: str, keyword: str, whole_word: bool, *, workspace_id: str | None = None, folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive") -> dict:
+    """Legacy exact-count tool, same engine as search_document_text
+    (case-insensitive), kept in its original result shape for existing
+    callers. `restricted_match` / `alert_raised` are internal: the agent
+    never shows them (see orchestrator._call_search_keyword)."""
+    db = SessionLocal()
+    try:
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
         decision = check_tool_access(grant=grant, tool_name="search_keyword")
         if not decision.allowed:
             _audit(db, user=user, role=grant.role if grant else None, action="MCP_SEARCH_KEYWORD", decision="DENY", reason=decision.reason)
-            return {"error": decision.reason}
-
-        pattern = build_pattern(keyword, whole_word)
-        if pattern is None:
-            return {"error": "mot-clé vide ou invalide"}
-
-        departments, max_rank = retrieval_scope(grant=grant)
-        normalized_kw = normalize(keyword)
-        # unaccent() only folds Latin diacritics (é/è/ç/...), not Arabic
-        # alef variants/tashkeel - an Arabic keyword skips this SQL
-        # pre-filter entirely and scans all authorized pages directly in
-        # Python instead, so it can never silently drop a real match.
-        use_sql_prefilter = not is_arabic_keyword(keyword)
-
-        def _prefiltered(query):
-            if use_sql_prefilter and normalized_kw:
-                return query.filter(func.unaccent(func.lower(DocumentPage.text)).ilike(f"%{normalized_kw}%"))
-            return query
-
+            return tool_error(ACCESS_DENIED, decision.reason)
         try:
-            documents: dict[str, dict] = {}
-            total_count = 0
-            if departments:
-                in_scope_query = (
-                    db.query(DocumentPage, Document)
-                    .join(Document, Document.id == DocumentPage.document_id)
-                    .filter(Document.department.in_(departments), Document.confidentiality_rank <= max_rank)
-                )
-                for page, doc in _prefiltered(in_scope_query).all():
-                    matches = find_matches(page.text, page.line_offset, pattern)
-                    if not matches:
-                        continue
-                    total_count += len(matches)
-                    entry = documents.setdefault(
-                        str(doc.id),
-                        {
-                            "document_id": str(doc.id),
-                            "title": doc.title,
-                            "department": doc.department,
-                            "confidentiality": doc.confidentiality,
-                            "count": 0,
-                            "locations": [],
-                        },
-                    )
-                    entry["count"] += len(matches)
-                    for match in matches:
-                        if len(entry["locations"]) < MAX_LOCATIONS_PER_DOCUMENT:
-                            entry["locations"].append(
-                                {"page": page.page_no, "section": page.section, "line": match.line, "excerpt": match.excerpt}
-                            )
-
-            # Same silent-filtering-detection pattern as
-            # retrieve_with_out_of_scope_signal: only probed when the
-            # caller's own authorized results came back empty, and only a
-            # metadata signal (department/confidentiality) is ever returned
-            # - never which document, its title, or its content.
-            out_of_scope_hint = None
-            if total_count == 0:
-                out_of_scope_condition = (
-                    or_(~Document.department.in_(departments), Document.confidentiality_rank > max_rank)
-                    if departments
-                    else true()
-                )
-                out_of_scope_query = (
-                    db.query(DocumentPage, Document)
-                    .join(Document, Document.id == DocumentPage.document_id)
-                    .filter(out_of_scope_condition)
-                )
-                for page, doc in _prefiltered(out_of_scope_query).limit(50).all():
-                    if find_matches(page.text, page.line_offset, pattern):
-                        out_of_scope_hint = {"department": doc.department, "confidentiality": doc.confidentiality}
-                        break
-        except Exception as exc:  # noqa: BLE001
-            # A query/code failure here is an infrastructure problem, not a
-            # permission decision - must never be phrased as (or alerted
-            # like) an access refusal. routers/chat.py specifically excludes
-            # any tool_trace reason starting with "service unavailable"
-            # from raising a Director alert (see EmbeddingServiceError
-            # handling in _search_documents_impl for the same convention).
-            _audit(
-                db,
-                user=user,
-                role=grant.role,
-                action="MCP_SEARCH_KEYWORD",
-                decision="DENY",
-                reason=f"service unavailable: {exc}",
+            result, hint = text_search.search_document_text(
+                db, user, grant, keyword, whole_word=whole_word, audit_action="MCP_SEARCH_KEYWORD"
             )
-            return {"error": str(exc), "service_unavailable": True}
-
-        _audit(
-            db,
-            user=user,
-            role=grant.role,
-            action="MCP_SEARCH_KEYWORD",
-            decision="ALLOW",
-            reason="ok",
-            extra={
-                "keyword": keyword,
-                "whole_word": whole_word,
-                "total_count": total_count,
-                "out_of_scope_hint": out_of_scope_hint,
-            },
-        )
+        except ServiceError:
+            return tool_error(VALIDATION_ERROR, "mot-clé vide ou invalide")
+        except Exception as exc:  # noqa: BLE001
+            _audit(db, user=user, role=grant.role, action="MCP_SEARCH_KEYWORD", decision="ERROR", reason=f"service unavailable: {exc}")
+            return tool_error(SERVICE_UNAVAILABLE, str(exc), service_unavailable=True)
 
         response: dict = {
             "keyword": keyword,
             "whole_word": whole_word,
-            "total_count": total_count,
-            "documents": sorted(documents.values(), key=lambda d: d["count"], reverse=True),
+            "total_count": result["total_occurrences"],
+            "documents": [
+                {
+                    "document_id": d["document_id"],
+                    "title": d["title"],
+                    "department": d["department"],
+                    "confidentiality": d["confidentiality"],
+                    "relative_path": d.get("relative_path"),
+                    "count": d["occurrences"],
+                    "locations": [
+                        {"page": m["page"], "section": m["section"], "line": m["line"], "excerpt": m["context"]}
+                        for m in d["matches"]
+                    ],
+                }
+                for d in result["documents"]
+            ],
         }
-        if out_of_scope_hint:
-            response["restricted_match"] = out_of_scope_hint
+        if hint:
+            response["restricted_match"] = hint
+            response["alert_raised"] = True
         return response
     finally:
         db.close()
@@ -341,14 +446,17 @@ def _list_documents_impl(
     date_min: str | None,
     date_max: str | None,
     author: str | None,
+    *,
+    workspace_id: str | None = None,
+    folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive",
 ) -> dict:
     db = SessionLocal()
     try:
-        user, grant = _load_user_and_grant(db, user_id)
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
         decision = check_tool_access(grant=grant, tool_name="list_documents")
         if not decision.allowed:
             _audit(db, user=user, role=grant.role if grant else None, action="MCP_LIST_DOCUMENTS", decision="DENY", reason=decision.reason)
-            return {"error": decision.reason}
+            return tool_error(ACCESS_DENIED, decision.reason)
 
         filters = {
             "document_type": document_type,
@@ -362,29 +470,24 @@ def _list_documents_impl(
             _audit(db, user=user, role=grant.role, action="MCP_LIST_DOCUMENTS", decision="ALLOW", reason="ok", extra={"filters": filters, "result_count": 0})
             return {"results": []}
 
-        scoped_departments = departments
-        if department:
-            if department not in departments:
-                # Requested a department outside this role's scope: same
-                # "never confirm or deny what exists elsewhere" principle as
-                # search_keyword's restricted_match - silently empty rather
-                # than a 403, no signal about whether anything is there.
-                _audit(db, user=user, role=grant.role, action="MCP_LIST_DOCUMENTS", decision="ALLOW", reason="ok", extra={"filters": filters, "result_count": 0})
-                return {"results": []}
-            scoped_departments = {department}
-
+        # A department filter only narrows document_scope - which already
+        # decides visibility (role, personal documents, Director rules): a
+        # department outside the role still lists the user's own payslip,
+        # and nothing else, with no signal about what else is there.
         query = (
             db.query(Document, User)
             .outerjoin(User, User.id == Document.owner_id)
-            .filter(Document.department.in_(scoped_departments), Document.confidentiality_rank <= max_rank)
+            .filter(*document_scope(grant))
         )
+        if department:
+            query = query.filter(Document.department == department)
         try:
             if date_min:
                 query = query.filter(Document.created_at >= datetime.fromisoformat(date_min))
             if date_max:
                 query = query.filter(Document.created_at < datetime.fromisoformat(date_max) + timedelta(days=1))
         except ValueError:
-            return {"error": "format de date invalide, utilisez AAAA-MM-JJ"}
+            return tool_error(VALIDATION_ERROR, "format de date invalide, utilisez AAAA-MM-JJ")
 
         rows = query.order_by(Document.created_at.desc()).limit(MAX_LIST_RESULTS).all()
 
@@ -405,6 +508,7 @@ def _list_documents_impl(
                     "department": doc.department,
                     "confidentiality": doc.confidentiality,
                     "type": ext,
+                    "relative_path": doc.relative_path,
                     "author": author_name,
                     "created_at": doc.created_at.isoformat(),
                 }
@@ -431,6 +535,9 @@ def _get_document_section_impl(
     page: int | None,
     section: str | None,
     offset: int,
+    *,
+    workspace_id: str | None = None,
+    folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive",
 ) -> dict:
     """Security-critical: a nonexistent document_id and one that exists but
     is outside the caller's grant must be completely indistinguishable to
@@ -450,14 +557,14 @@ def _get_document_section_impl(
     """
     db = SessionLocal()
     try:
-        user, grant = _load_user_and_grant(db, user_id)
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
         decision = check_tool_access(grant=grant, tool_name="get_document_section")
         if not decision.allowed:
             _audit(db, user=user, role=grant.role if grant else None, action="MCP_GET_DOCUMENT_SECTION", decision="DENY", reason=decision.reason)
-            return {"error": decision.reason}
+            return tool_error(ACCESS_DENIED, decision.reason)
 
         if not document_id and not document_name:
-            return {"error": "précisez document_id ou document_name"}
+            return tool_error(VALIDATION_ERROR, "précisez document_id ou document_name")
 
         departments, max_rank = retrieval_scope(grant=grant)
 
@@ -471,30 +578,41 @@ def _get_document_section_impl(
                 doc = db.get(Document, doc_uuid)
         else:
             normalized_name = normalize(document_name)
-            candidates: list[Document] = []
-            if departments:
-                candidates = (
-                    db.query(Document)
-                    .filter(Document.department.in_(departments), Document.confidentiality_rank <= max_rank)
-                    .all()
-                )
-            exact = [d for d in candidates if normalize(d.title) == normalized_name]
-            partial = [d for d in candidates if normalized_name and normalized_name in normalize(d.title)]
-            matches = exact or partial
+            candidates: list[Document] = db.query(Document).filter(*document_scope(grant)).all() if departments else []
+            exact = [d for d in candidates if normalized_name in _document_names(d)]
+            partial_matches = [
+                d for d in candidates if normalized_name and any(normalized_name in n for n in _document_names(d))
+            ]
+            matches = exact or partial_matches
 
             if not matches:
-                _audit(
-                    db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="ALLOW",
-                    reason="ok", extra={"document_name": document_name, "match_count": 0},
-                )
-                return {"error": DOCUMENT_NOT_FOUND_OR_DENIED}
+                # Nothing the caller may read. An EXACT name match on a
+                # protected document of the same workspace is still a real
+                # attempt on it: handed to the access check below so it is
+                # refused, audited and alerted - with the very same neutral
+                # answer as a genuine absence.
+                protected = [
+                    d for d in db.query(Document).filter(*outside_document_scope(grant)).all()
+                    if normalized_name and normalized_name in _document_names(d)
+                ]
+                if len(protected) != 1:
+                    _audit(
+                        db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="ALLOW",
+                        reason="ok", extra={"document_name": document_name, "match_count": 0},
+                    )
+                    return tool_error(NOT_FOUND, DOCUMENT_NOT_FOUND_OR_DENIED, concealed=True)
+                matches = protected
             if len(matches) > 1:
                 _audit(
                     db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="ALLOW",
                     reason="ok", extra={"document_name": document_name, "match_count": len(matches)},
                 )
                 return {
-                    "choices": [{"document_id": str(d.id), "title": d.title} for d in matches[:MAX_TITLE_CHOICES]],
+                    "choices": [
+                        {"document_id": str(d.id), "title": d.title, "relative_path": d.relative_path}
+                        for d in sorted(matches, key=lambda d: (d.relative_path or d.title).lower())[:MAX_TITLE_CHOICES]
+                    ],
+                    "match_count": len(matches),
                     "page": page,
                     "section": section,
                 }
@@ -505,9 +623,15 @@ def _get_document_section_impl(
                 db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="DENY",
                 resource_id=document_id, reason="document not found",
             )
-            return {"error": DOCUMENT_NOT_FOUND_OR_DENIED}
+            return tool_error(NOT_FOUND, DOCUMENT_NOT_FOUND_OR_DENIED, concealed=True)
 
-        access_decision = check_document_access(grant=grant, department=doc.department, confidentiality=doc.confidentiality)
+        access_decision = check_document_in_scope(grant=grant, document=doc)
+        if not access_decision.allowed and access_decision.out_of_context:
+            _audit(
+                db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="DENY",
+                resource_type="document", resource_id=str(doc.id), reason=access_decision.reason,
+            )
+            return tool_error(NOT_FOUND, DOCUMENT_NOT_FOUND_OR_DENIED, concealed=True)
         if not access_decision.allowed:
             _audit(
                 db, user=user, role=grant.role, action="MCP_GET_DOCUMENT_SECTION", decision="DENY",
@@ -526,8 +650,9 @@ def _get_document_section_impl(
                 ),
                 resource_type="document",
                 resource_id=str(doc.id),
+                dedup_key=security_event_key(user.id, "DOCUMENT_ACCESS_DENIED", "get_document_section", doc.id),
             )
-            return {"error": DOCUMENT_NOT_FOUND_OR_DENIED}
+            return tool_error(ACCESS_DENIED, DOCUMENT_NOT_FOUND_OR_DENIED, concealed=True, alert_raised=True)
 
         page_query = db.query(DocumentPage).filter(DocumentPage.document_id == doc.id)
         if page is None and not section:
@@ -539,7 +664,7 @@ def _get_document_section_impl(
             # that genuinely doesn't exist still errors normally below.
             match = page_query.order_by(DocumentPage.order_index).first()
             if match is None:
-                return {"error": f"« {doc.title} » n'a aucun contenu indexé"}
+                return tool_error(NOT_FOUND, f"« {doc.title} » n'a aucun contenu indexé")
             page, section = match.page_no, match.section
         elif page is not None:
             match = page_query.filter(DocumentPage.page_no == page).first()
@@ -558,7 +683,7 @@ def _get_document_section_impl(
                 extra={"title": doc.title, "page": page, "section": section},
             )
             where = f"page {page}" if page is not None else f"section « {section} »"
-            return {"error": f"{where} introuvable dans « {doc.title} »"}
+            return tool_error(NOT_FOUND, f"{where} introuvable dans « {doc.title} »")
 
         total_length = len(match.text)
         start = max(0, offset)
@@ -574,6 +699,7 @@ def _get_document_section_impl(
         return {
             "document_id": str(doc.id),
             "title": doc.title,
+            "relative_path": doc.relative_path,
             "department": doc.department,
             "confidentiality": doc.confidentiality,
             "page": match.page_no,
@@ -590,18 +716,35 @@ def _get_document_section_impl(
 _STOPWORDS = {
     "le", "la", "les", "un", "une", "des", "de", "du", "quel", "quelle", "quels", "quelles",
     "est", "sont", "pour", "avec", "dans", "sur", "moi", "donne", "montre", "quelle", "que",
-    "qui", "combien", "budget", "svp", "please", "the", "what", "is", "for", "me", "show",
+    "qui", "combien", "budget", "budgets", "svp", "please", "the", "what", "is", "for", "me", "show",
+    # pronouns / glue: never what a financial line is about
+    "je", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles", "et", "ou", "au", "aux", "en", "par",
+    "ce", "cet", "cette", "ces", "mon", "ma", "mes", "ton", "ta", "tes", "son", "sa", "ses", "notre", "nos",
+    "peut", "peux", "pouvez", "fais", "faire", "trace", "courbe", "graphique", "evolution", "annee", "annees",
+    "total", "totale", "montant", "montants", "valeur", "valeurs",
 }
 
 
-def _search_database_impl(user_id: str, query: str) -> dict:
+def _significant_terms(query: str) -> set[str]:
+    """Normalized whole words that can identify a financial line."""
+    return {
+        w for w in re.findall(r"[a-z0-9]+", normalize(query))
+        if len(w) >= 2 and not w.isdigit() and w not in _STOPWORDS
+    }
+
+
+def _label_words(label: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", normalize(label or "")))
+
+
+def _search_database_impl(user_id: str, query: str, *, workspace_id: str | None = None, folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive") -> dict:
     db = SessionLocal()
     try:
-        user, grant = _load_user_and_grant(db, user_id)
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
         decision = check_tool_access(grant=grant, tool_name="search_database")
         if not decision.allowed:
             _audit(db, user=user, role=grant.role if grant else None, action="MCP_SEARCH_DATABASE", decision="DENY", reason=decision.reason)
-            return {"error": decision.reason}
+            return tool_error(ACCESS_DENIED, decision.reason)
 
         departments, max_rank = retrieval_scope(grant=grant)
         base_query = db.query(FinancialRecord).filter(
@@ -609,15 +752,25 @@ def _search_database_impl(user_id: str, query: str) -> dict:
             FinancialRecord.confidentiality_rank <= max_rank,
         )
 
-        # Free-text queries rarely match a record label as an exact
-        # substring ("quel est le budget IT 2025" vs. "Budget IT /
-        # Infrastructure 2025"), so match on any significant keyword
-        # instead of the whole phrase.
-        tokens = [w for w in re.findall(r"[a-zA-ZÀ-ÿ]{2,}", query.lower()) if w not in _STOPWORDS]
-        if tokens:
-            base_query = base_query.filter(or_(*[FinancialRecord.label.ilike(f"%{t}%") for t in tokens]))
-
-        rows = base_query.limit(20).all()
+        # Authorized rows only (department + confidentiality above), THEN
+        # matched. An explicit empty query lists the authorized catalog (the
+        # chart planner picks in it only what the user names). A free-text
+        # query matches on WHOLE significant words, accents and case
+        # ignored: "tu" no longer matches "Infras-tu-cture" (the bug that
+        # put "Budget IT / Infrastructure 2025" under "le budget du projet").
+        # Only generic words -> nothing (never an arbitrary record); a year
+        # written in the query is a structured criterion.
+        authorized = base_query.order_by(FinancialRecord.label).all()
+        if not query.strip():
+            rows = authorized
+        else:
+            terms = _significant_terms(query)
+            years = {int(y) for y in re.findall(r"\b(?:19|20)\d{2}\b", query)}
+            rows = [
+                r for r in authorized
+                if terms and terms & _label_words(r.label) and (not years or r.year in years)
+            ]
+        rows = rows[:20]
         _audit(
             db,
             user=user,
@@ -637,21 +790,20 @@ def _search_database_impl(user_id: str, query: str) -> dict:
         db.close()
 
 
-def _get_company_information_impl(user_id: str, topic: str) -> dict:
+def _get_company_information_impl(user_id: str, topic: str, *, workspace_id: str | None = None, folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive") -> dict:
     db = SessionLocal()
     try:
-        user, grant = _load_user_and_grant(db, user_id)
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
         decision = check_tool_access(grant=grant, tool_name="get_company_information")
         if not decision.allowed:
             _audit(db, user=user, role=grant.role if grant else None, action="MCP_COMPANY_INFO", decision="DENY", reason=decision.reason)
-            return {"error": decision.reason}
+            return tool_error(ACCESS_DENIED, decision.reason)
 
-        _, max_rank = retrieval_scope(grant=grant)
         rows = (
             db.query(Document)
             .filter(
+                *document_scope(grant),
                 Document.department == "GENERAL",
-                Document.confidentiality_rank <= max_rank,
                 (Document.title.ilike(f"%{topic}%") | Document.content.ilike(f"%{topic}%")),
             )
             .limit(3)
@@ -694,33 +846,41 @@ def _resolve_spreadsheet_document(
         try:
             doc_uuid = uuid.UUID(document_id)
         except ValueError:
-            return None, {"error": DOCUMENT_NOT_FOUND_OR_DENIED, "error_kind": "file_not_found"}
+            return None, tool_error(NOT_FOUND, DOCUMENT_NOT_FOUND_OR_DENIED, concealed=True, error_kind="file_not_found")
         return db.get(Document, doc_uuid), None
 
     normalized_name = normalize(document_name or "")
-    candidates: list[Document] = []
-    if departments:
-        candidates = (
-            db.query(Document)
-            .filter(Document.department.in_(departments), Document.confidentiality_rank <= max_rank)
-            .all()
-        )
-
-    def names(d: Document) -> list[str]:
-        return [normalize(d.title), normalize(d.source_filename or "")]
+    candidates: list[Document] = db.query(Document).filter(*document_scope(grant)).all() if departments else []
+    names = _document_names
 
     exact = [d for d in candidates if normalized_name in names(d)]
     partial = [d for d in candidates if normalized_name and any(normalized_name in n for n in names(d))]
     matches = exact or partial
 
     if not matches:
-        return None, {"error": DOCUMENT_NOT_FOUND_OR_DENIED, "error_kind": "file_not_found"}
+        # Nothing the caller may see. An EXACT name match outside their
+        # grant is still a genuine attempt on a protected document (case B):
+        # it is handed back so the caller's check_document_access refuses
+        # it, audits it and alerts - while the user-facing answer stays the
+        # same neutral DOCUMENT_NOT_FOUND_OR_DENIED as a real absence.
+        # Exact only: a partial match on someone else's document is far too
+        # weak a signal to page a Director over.
+        if normalized_name:
+            out_of_scope = db.query(Document).filter(*outside_document_scope(grant)).all()
+            protected = [d for d in out_of_scope if normalized_name in names(d)]
+            if len(protected) == 1:
+                return protected[0], None
+        return None, tool_error(NOT_FOUND, DOCUMENT_NOT_FOUND_OR_DENIED, concealed=True, error_kind="file_not_found")
     if len(matches) > 1:
         titles = ", ".join(d.title for d in matches[:MAX_TITLE_CHOICES])
         return None, {
+            "code": AMBIGUOUS,
+            "status": "ambiguous",
             "error": f"plusieurs documents correspondent à « {document_name} » ({titles}) - précisez lequel.",
             "error_kind": "ambiguous_file",
-            "choices": [{"document_id": str(d.id), "title": d.title} for d in matches[:MAX_TITLE_CHOICES]],
+            "choices": [
+                {"document_id": str(d.id), "title": d.title, "relative_path": d.relative_path} for d in matches[:MAX_TITLE_CHOICES]
+            ],
         }
     return matches[0], None
 
@@ -736,32 +896,14 @@ def _resolve_spreadsheet_sheet(db, doc: Document, sheet_name: str | None) -> tup
         if p.section
     ]
     if not sheet_names:
-        return None, {"error": f"« {doc.title} » ne contient aucune feuille indexée", "error_kind": "sheet_not_found"}
+        return None, tool_error(NOT_FOUND, f"« {doc.title} » ne contient aucune feuille indexée", error_kind="sheet_not_found")
 
-    if sheet_name is None:
-        if len(sheet_names) == 1:
-            return sheet_names[0], None
-        return None, {
-            "error": (
-                f"« {doc.title} » contient plusieurs feuilles ({', '.join(sheet_names)}) - "
-                "précisez laquelle utiliser."
-            ),
-            "error_kind": "ambiguous_sheet",
-        }
-
-    normalized_target = normalize(sheet_name)
-    exact = [s for s in sheet_names if normalize(s) == normalized_target]
-    partial = [s for s in sheet_names if normalized_target in normalize(s)]
-    matches = exact or partial
-    if not matches:
-        return None, {
-            "error": (
-                f"feuille « {sheet_name} » introuvable dans « {doc.title} ». "
-                f"Feuilles disponibles : {', '.join(sheet_names)}"
-            ),
-            "error_kind": "sheet_not_found",
-        }
-    return matches[0], None
+    resolved, err = resolve_sheet_name(sheet_names, sheet_name, doc.title)
+    if err is not None:
+        code, message, kind = err
+        # The real sheet names, so the agent can offer them as choices.
+        return None, tool_error(code, message, error_kind=kind, sheets=sheet_names)
+    return resolved, None
 
 
 def _load_sheet_rows(doc: Document, sheet_title: str) -> tuple[dict | None, dict | None]:
@@ -773,40 +915,27 @@ def _load_sheet_rows(doc: Document, sheet_title: str) -> tuple[dict | None, dict
     which documents that the RAG pipeline never does)."""
     ext = (doc.source_filename or "").rsplit(".", 1)[-1].lower() if doc.source_filename and "." in doc.source_filename else ""
     if ext not in SPREADSHEET_EXTENSIONS:
-        return None, {"error": f"« {doc.title} » n'est pas un classeur Excel (.xlsx)", "error_kind": "not_spreadsheet"}
+        return None, tool_error(VALIDATION_ERROR, f"« {doc.title} » n'est pas un classeur Excel (.xlsx)", error_kind="not_spreadsheet")
     if not doc.minio_object_key:
-        return None, {"error": f"le fichier original de « {doc.title} » n'est plus disponible", "error_kind": "file_unavailable"}
+        return None, tool_error(NOT_FOUND, f"le fichier original de « {doc.title} » n'est plus disponible", error_kind="file_unavailable")
 
     try:
         raw = download_file(doc.minio_object_key)
     except Exception:  # noqa: BLE001 - MinIO down/unreachable, not a data problem
-        return None, {"error": "le service de fichiers est momentanément indisponible", "service_unavailable": True}
+        return None, tool_error(SERVICE_UNAVAILABLE, "le service de fichiers est momentanément indisponible", service_unavailable=True)
 
-    from io import BytesIO
-
-    from openpyxl import load_workbook
-
-    workbook = load_workbook(BytesIO(raw), data_only=True, read_only=True)
-    worksheet = next((s for s in workbook.worksheets if s.title == sheet_title), None)
-    if worksheet is None:
-        return None, {"error": f"feuille « {sheet_title} » introuvable dans le fichier original", "error_kind": "sheet_not_found"}
-
-    all_rows = list(worksheet.iter_rows(values_only=True))
-    if not all_rows:
-        return None, {"error": f"la feuille « {sheet_title} » est vide", "error_kind": "empty_sheet"}
-
-    headers = [str(c).strip() if c is not None else "" for c in all_rows[0]]
-    rows: list[dict] = []
-    for raw_row in all_rows[1:]:
-        row = {h: v for h, v in zip(headers, raw_row) if h}
-        if any(v is not None for v in row.values()):
-            rows.append(row)
-
-    return {"headers": [h for h in headers if h], "rows": rows}, None
+    sheet_data, err = read_sheet_rows(raw, sheet_title)
+    if err is not None:
+        code, message, kind = err
+        return None, tool_error(code, message, error_kind=kind)
+    return sheet_data, None
 
 
 def _read_spreadsheet_impl(
-    user_id: str, document_id: str | None, document_name: str | None, sheet_name: str | None
+    user_id: str, document_id: str | None, document_name: str | None, sheet_name: str | None,
+    *,
+    workspace_id: str | None = None,
+    folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive",
 ) -> dict:
     """Structured, ACL-scoped, never-approximated read of one sheet of an
     internal .xlsx document - the priority data source for generate_chart
@@ -818,29 +947,36 @@ def _read_spreadsheet_impl(
     the dataset is always resolved fresh, never reused across turns."""
     db = SessionLocal()
     try:
-        user, grant = _load_user_and_grant(db, user_id)
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
         decision = check_tool_access(grant=grant, tool_name="read_spreadsheet_data")
         if not decision.allowed:
             _audit(db, user=user, role=grant.role if grant else None, action="MCP_READ_SPREADSHEET", decision="DENY", reason=decision.reason)
-            return {"error": decision.reason, "error_kind": "policy_denied"}
+            return tool_error(ACCESS_DENIED, decision.reason, error_kind="policy_denied")
 
         if not document_id and not document_name:
-            return {"error": "précisez document_id ou document_name", "error_kind": "file_not_found"}
+            return tool_error(VALIDATION_ERROR, "précisez document_id ou document_name", error_kind="file_not_found")
 
         doc, err = _resolve_spreadsheet_document(db, grant, document_id, document_name)
         if err is not None:
             _audit(
                 db, user=user, role=grant.role, action="MCP_READ_SPREADSHEET",
-                decision="ALLOW" if "choices" in err else "DENY", reason=err.get("error", "ambiguous document name"),
+                decision="DENY" if err.get("code") == ACCESS_DENIED else "ALLOW",
+                reason=err.get("error", "ambiguous document name"),
                 extra={"document_name": document_name},
             )
             return err
 
         if doc is None:
-            _audit(db, user=user, role=grant.role, action="MCP_READ_SPREADSHEET", decision="DENY", reason="document not found")
-            return {"error": DOCUMENT_NOT_FOUND_OR_DENIED, "error_kind": "file_not_found"}
+            _audit(db, user=user, role=grant.role, action="MCP_READ_SPREADSHEET", decision="ALLOW", reason="document not found")
+            return tool_error(NOT_FOUND, DOCUMENT_NOT_FOUND_OR_DENIED, concealed=True, error_kind="file_not_found")
 
-        access_decision = check_document_access(grant=grant, department=doc.department, confidentiality=doc.confidentiality)
+        access_decision = check_document_in_scope(grant=grant, document=doc)
+        if not access_decision.allowed and access_decision.out_of_context:
+            _audit(
+                db, user=user, role=grant.role, action="MCP_READ_SPREADSHEET", decision="DENY",
+                resource_type="document", resource_id=str(doc.id), reason=access_decision.reason,
+            )
+            return tool_error(NOT_FOUND, DOCUMENT_NOT_FOUND_OR_DENIED, concealed=True, error_kind="file_not_found")
         if not access_decision.allowed:
             _audit(
                 db, user=user, role=grant.role, action="MCP_READ_SPREADSHEET", decision="DENY",
@@ -855,8 +991,11 @@ def _read_spreadsheet_impl(
                     f"Refus : {access_decision.reason}"
                 ),
                 resource_type="document", resource_id=str(doc.id),
+                dedup_key=security_event_key(user.id, "DOCUMENT_ACCESS_DENIED", "read_spreadsheet_data", doc.id),
             )
-            return {"error": DOCUMENT_NOT_FOUND_OR_DENIED, "error_kind": "file_not_found"}
+            return tool_error(
+                ACCESS_DENIED, DOCUMENT_NOT_FOUND_OR_DENIED, concealed=True, alert_raised=True, error_kind="file_not_found"
+            )
 
         resolved_sheet, err = _resolve_spreadsheet_sheet(db, doc, sheet_name)
         if err is not None:
@@ -904,6 +1043,9 @@ def _generate_chart_impl(
     value_fields: list[dict],
     data: list[dict],
     sources: list[dict] | None,
+    *,
+    workspace_id: str | None = None,
+    folder_scope: tuple[str, ...] = (), folder_depth: str = "recursive",
 ) -> dict:
     """Validates and echoes back an already-built chart spec - it never
     fetches data itself. The caller (app/agent/orchestrator.py's
@@ -915,11 +1057,11 @@ def _generate_chart_impl(
     same audited checkpoint as every other tool result."""
     db = SessionLocal()
     try:
-        user, grant = _load_user_and_grant(db, user_id)
+        user, grant = _load_user_and_grant(db, user_id, workspace_id, folder_scope, folder_depth)
         decision = check_tool_access(grant=grant, tool_name="generate_chart")
         if not decision.allowed:
             _audit(db, user=user, role=grant.role if grant else None, action="MCP_GENERATE_CHART", decision="DENY", reason=decision.reason)
-            return {"error": decision.reason}
+            return tool_error(ACCESS_DENIED, decision.reason)
 
         try:
             validate_chart_spec(
@@ -930,7 +1072,7 @@ def _generate_chart_impl(
                 db, user=user, role=grant.role, action="MCP_GENERATE_CHART", decision="ALLOW", reason="ok",
                 extra={"chart_type": chart_type, "title": title, "validation_error": str(exc)},
             )
-            return {"error": str(exc)}
+            return tool_error(VALIDATION_ERROR, str(exc))
 
         _audit(
             db, user=user, role=grant.role, action="MCP_GENERATE_CHART", decision="ALLOW", reason="ok",
@@ -961,8 +1103,23 @@ async def search_documents(query: str, ctx: Context, top_k: int = 5) -> dict:
     try:
         identity = extract_identity(ctx)
     except IdentityError as exc:
-        return {"error": str(exc)}
-    return await anyio.to_thread.run_sync(_search_documents_impl, identity.user_id, query, top_k)
+        return _identity_error(exc)
+    return await anyio.to_thread.run_sync(
+        partial(_search_documents_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id, query, top_k)
+
+
+@mcp_app.tool()
+async def find_document_amounts(ctx: Context) -> dict:
+    """Every amount (with a currency) written in a sentence about a budget,
+    an amount or a cost, in ALL the pages of the documents the caller may
+    read in the current scope - each with its document, path, page and
+    sentence. Read-only, no model involved."""
+    try:
+        identity = extract_identity(ctx)
+    except IdentityError as exc:
+        return _identity_error(exc)
+    return await anyio.to_thread.run_sync(
+        partial(_find_document_amounts_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id)
 
 
 @mcp_app.tool()
@@ -971,8 +1128,29 @@ async def get_document(document_id: str, ctx: Context) -> dict:
     try:
         identity = extract_identity(ctx)
     except IdentityError as exc:
-        return {"error": str(exc)}
-    return await anyio.to_thread.run_sync(_get_document_impl, identity.user_id, document_id)
+        return _identity_error(exc)
+    return await anyio.to_thread.run_sync(
+        partial(_get_document_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id, document_id)
+
+
+@mcp_app.tool()
+async def search_document_text(
+    query: str, ctx: Context, case_sensitive: bool = False, whole_word: bool = True, count_only: bool = False
+) -> dict:
+    """EXACT text search in the internal documents the caller may read - for
+    "combien de fois X apparaît", "est-ce que X est présent", a name, an
+    identifier or an exact phrase (not the semantic search_documents).
+    Returns the total number of occurrences and, per document, the
+    occurrences with page/section/line and surrounding context.
+    case_sensitive: match the exact case; whole_word: whole words only (a
+    phrase is matched as a whole); count_only: counts without contexts."""
+    try:
+        identity = extract_identity(ctx)
+    except IdentityError as exc:
+        return _identity_error(exc)
+    return await anyio.to_thread.run_sync(
+        partial(_search_document_text_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id, query, case_sensitive, whole_word, count_only
+    )
 
 
 @mcp_app.tool()
@@ -985,8 +1163,9 @@ async def search_keyword(keyword: str, ctx: Context, whole_word: bool = True) ->
     try:
         identity = extract_identity(ctx)
     except IdentityError as exc:
-        return {"error": str(exc)}
-    return await anyio.to_thread.run_sync(_search_keyword_impl, identity.user_id, keyword, whole_word)
+        return _identity_error(exc)
+    return await anyio.to_thread.run_sync(
+        partial(_search_keyword_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id, keyword, whole_word)
 
 
 @mcp_app.tool()
@@ -1005,9 +1184,23 @@ async def list_documents(
     try:
         identity = extract_identity(ctx)
     except IdentityError as exc:
-        return {"error": str(exc)}
+        return _identity_error(exc)
     return await anyio.to_thread.run_sync(
-        _list_documents_impl, identity.user_id, document_type, department, date_min, date_max, author
+        partial(_list_documents_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id, document_type, department, date_min, date_max, author
+    )
+
+
+@mcp_app.tool()
+async def list_folders(ctx: Context) -> dict:
+    """Folders of the current workspace that contain documents the caller may
+    read, with document counts (internal - used to resolve a folder named in
+    the question; never offered to the model)."""
+    try:
+        identity = extract_identity(ctx)
+    except IdentityError as exc:
+        return _identity_error(exc)
+    return await anyio.to_thread.run_sync(
+        partial(_list_folders_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id
     )
 
 
@@ -1032,9 +1225,9 @@ async def get_document_section(
     try:
         identity = extract_identity(ctx)
     except IdentityError as exc:
-        return {"error": str(exc)}
+        return _identity_error(exc)
     return await anyio.to_thread.run_sync(
-        _get_document_section_impl, identity.user_id, document_id, document_name, page, section, offset
+        partial(_get_document_section_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id, document_id, document_name, page, section, offset
     )
 
 
@@ -1058,8 +1251,9 @@ async def read_spreadsheet_data(
     try:
         identity = extract_identity(ctx)
     except IdentityError as exc:
-        return {"error": str(exc)}
-    return await anyio.to_thread.run_sync(_read_spreadsheet_impl, identity.user_id, document_id, document_name, sheet_name)
+        return _identity_error(exc)
+    return await anyio.to_thread.run_sync(
+        partial(_read_spreadsheet_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id, document_id, document_name, sheet_name)
 
 
 @mcp_app.tool()
@@ -1084,10 +1278,9 @@ async def generate_chart(
     try:
         identity = extract_identity(ctx)
     except IdentityError as exc:
-        return {"error": str(exc)}
+        return _identity_error(exc)
     return await anyio.to_thread.run_sync(
-        _generate_chart_impl,
-        identity.user_id,
+        partial(_generate_chart_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id,
         chart_type,
         title,
         category_field,
@@ -1105,8 +1298,9 @@ async def search_database(query: str, ctx: Context) -> dict:
     try:
         identity = extract_identity(ctx)
     except IdentityError as exc:
-        return {"error": str(exc)}
-    return await anyio.to_thread.run_sync(_search_database_impl, identity.user_id, query)
+        return _identity_error(exc)
+    return await anyio.to_thread.run_sync(
+        partial(_search_database_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id, query)
 
 
 @mcp_app.tool()
@@ -1115,9 +1309,11 @@ async def get_company_information(topic: str, ctx: Context) -> dict:
     try:
         identity = extract_identity(ctx)
     except IdentityError as exc:
-        return {"error": str(exc)}
-    return await anyio.to_thread.run_sync(_get_company_information_impl, identity.user_id, topic)
+        return _identity_error(exc)
+    return await anyio.to_thread.run_sync(
+        partial(_get_company_information_impl, workspace_id=identity.workspace_id, folder_scope=identity.folder_scope, folder_depth=identity.folder_depth), identity.user_id, topic)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s - %(message)s")
     mcp_app.run(transport="streamable-http")

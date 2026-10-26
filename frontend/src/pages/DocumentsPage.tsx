@@ -1,11 +1,18 @@
 import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent } from 'react'
+import { useWorkspaceContext } from '../context/WorkspaceContext'
+import { DocumentAccessPanel } from '../components/DocumentAccessPanel'
+import { FoldersPanel } from '../components/FoldersPanel'
+import { ImagePreview } from '../components/DocumentPreview'
+import { isImageFile } from '../lib/fileTypes'
 import { useSearchParams } from 'react-router-dom'
 import {
+  adminListUsers,
   createDocument,
   downloadDocumentFile,
   getDocument,
   getWatchStatus,
   listDocuments,
+  listFolders,
   updateDocument,
   uploadDocument,
 } from '../api/endpoints'
@@ -13,16 +20,31 @@ import { ApiError } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 import { ConfidentialityBadge } from '../components/Badges'
 import { IconDocument, IconSearch } from '../components/Icons'
-import type { DocumentDetail, DocumentSummary } from '../types'
+import type { DocumentDetail, DocumentSummary, UserOut, WorkspaceFolders } from '../types'
 
 const DEPARTMENTS = ['HR', 'FINANCE', 'TECH', 'GENERAL', 'EXEC']
 const LEVELS = ['PUBLIC', 'INTERNAL', 'CONFIDENTIAL', 'SECRET']
-const ACCEPTED_EXTENSIONS = ['.txt', '.md', '.pdf', '.xlsx', '.docx']
+const ACCEPTED_EXTENSIONS = ['.txt', '.md', '.csv', '.pdf', '.xlsx', '.docx', '.png', '.jpg', '.jpeg', '.webp']
 
 export function DocumentsPage() {
   const { user } = useAuth()
   const [searchParams, setSearchParams] = useSearchParams()
   const [documents, setDocuments] = useState<DocumentSummary[]>([])
+  // Same current workspace as /chat; the backend filters the list by it
+  // (and refuses a workspace this user may not use).
+  const {
+    workspaces,
+    workspace,
+    workspaceId,
+    selectWorkspace,
+    refreshWorkspaces,
+    folderName,
+    needsPermission,
+    syncState,
+    syncVersion,
+    lastSyncAt,
+    reauthorizeFolder,
+  } = useWorkspaceContext()
   const [loading, setLoading] = useState(true)
   const [selected, setSelected] = useState<DocumentDetail | null>(null)
   const [modalError, setModalError] = useState<string | null>(null)
@@ -38,6 +60,11 @@ export function DocumentsPage() {
   const [query, setQuery] = useState(searchParams.get('q') ?? '')
   const [deptFilter, setDeptFilter] = useState('')
   const [levelFilter, setLevelFilter] = useState('')
+  const [folderFilter, setFolderFilter] = useState('')
+  // Documents of the selected folder: with its sub-folders (default) or only
+  // those directly inside it.
+  const [includeSubfolders, setIncludeSubfolders] = useState(true)
+  const [folders, setFolders] = useState<WorkspaceFolders>({ can_manage: false, folders: [] })
   const [watchStatus, setWatchStatus] = useState<{ enabled: boolean; department: string; confidentiality: string } | null>(null)
 
   useEffect(() => {
@@ -68,22 +95,43 @@ export function DocumentsPage() {
 
   const filteredDocuments = useMemo(() => {
     return documents.filter((d) => {
-      if (query && !d.title.toLowerCase().includes(query.toLowerCase())) return false
+      if (query && !`${d.title} ${d.relative_path ?? ''}`.toLowerCase().includes(query.toLowerCase())) return false
       if (deptFilter && d.department !== deptFilter) return false
       if (levelFilter && d.confidentiality !== levelFilter) return false
+      const path = d.relative_path ?? ''
+      if (folderFilter && !path.startsWith(folderFilter)) return false
+      if (!includeSubfolders && path.slice(folderFilter.length).includes('/')) return false
       return true
     })
-  }, [documents, query, deptFilter, levelFilter])
+  }, [documents, query, deptFilter, levelFilter, folderFilter, includeSubfolders])
 
+  // While some documents are still being read or embedded, refresh their progress.
+  const indexing = documents.some((d) => ['queued', 'extracting', 'indexing'].includes(d.status))
   useEffect(() => {
-    loadDocuments()
-  }, [])
+    if (!indexing) return
+    const timer = setInterval(loadDocuments, 5000)
+    return () => clearInterval(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [indexing, workspaceId])
+
+  // Reloaded when the workspace changes AND after every automatic sync that
+  // added/updated/removed files from the connected folder.
+  useEffect(() => {
+    if (workspaceId) loadDocuments()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceId, syncVersion])
 
   async function loadDocuments() {
+    if (!workspaceId) return
     setLoading(true)
     try {
-      const docs = await listDocuments()
+      const [docs, tree] = await Promise.all([
+        listDocuments(workspaceId),
+        listFolders(workspaceId).catch(() => ({ can_manage: false, folders: [] })),
+      ])
       setDocuments(docs)
+      setFolders(tree)
+      if (folderFilter && !tree.folders.some((f) => f.path === folderFilter)) setFolderFilter('')
     } finally {
       setLoading(false)
     }
@@ -101,10 +149,22 @@ export function DocumentsPage() {
     }
   }
 
+  const isDirector = user?.role === 'DIRECTOR'
+  const [editSubject, setEditSubject] = useState('')
+  const [people, setPeople] = useState<UserOut[]>([])
+
+  useEffect(() => {
+    if (!editing || !isDirector || people.length) return
+    adminListUsers()
+      .then((list) => setPeople(list.filter((u) => u.is_active)))
+      .catch(() => {})
+  }, [editing, isDirector, people.length])
+
   function startEdit() {
     if (!selected) return
     setEditDept(selected.department)
     setEditLevel(selected.confidentiality)
+    setEditSubject(selected.subject_user_id ?? '')
     setEditError(null)
     setEditing(true)
   }
@@ -114,7 +174,12 @@ export function DocumentsPage() {
     setEditSaving(true)
     setEditError(null)
     try {
-      const updated = await updateDocument(selected.id, { department: editDept, confidentiality: editLevel })
+      const subjectChanged = isDirector && editSubject !== (selected.subject_user_id ?? '')
+      const updated = await updateDocument(selected.id, {
+        department: editDept,
+        confidentiality: editLevel,
+        ...(subjectChanged ? { subject_user_id: editSubject || null } : {}),
+      })
       setSelected(updated)
       setEditing(false)
       loadDocuments()
@@ -163,9 +228,36 @@ export function DocumentsPage() {
         <div>
           <h1>Documents</h1>
           <p>
-            Cette liste est déjà filtrée côté serveur : elle ne contient que les documents que votre rôle («
-            {user?.role}») est autorisé à consulter.
+            Cette liste est déjà filtrée côté serveur : elle ne contient que les documents de l'espace de travail
+            sélectionné que votre rôle («{user?.role}») est autorisé à consulter.
           </p>
+          <label className="workspace-select">
+            📁 Workspace :
+            <select className="input" value={workspaceId ?? ''} onChange={(e) => selectWorkspace(e.target.value)}>
+              {workspaces.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.name}
+                  {w.folder_name ? ` (dossier : ${w.folder_name})` : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+          {folderName && (
+            <p className="workspace-hint" style={{ marginTop: 6 }}>
+              {needsPermission ? (
+                <button type="button" className="btn btn-primary" style={{ padding: '3px 10px', fontSize: 12 }} onClick={reauthorizeFolder}>
+                  🔓 Réactiver la synchronisation de « {folderName} »
+                </button>
+              ) : syncState === 'syncing' ? (
+                <>🟡 Synchronisation du dossier « {folderName} »…</>
+              ) : (
+                <>
+                  🟢 Dossier « {folderName} » synchronisé automatiquement (nouveaux fichiers et sous-dossiers inclus)
+                  {lastSyncAt && <> — dernière synchronisation : {lastSyncAt.toLocaleTimeString('fr-FR')}</>}
+                </>
+              )}
+            </p>
+          )}
         </div>
         <button className="btn" onClick={() => setShowCreate((v) => !v)}>
           {showCreate ? 'Fermer' : '+ Ajouter un document'}
@@ -183,6 +275,11 @@ export function DocumentsPage() {
 
       {showCreate && (
         <CreateDocumentForm
+          workspaceId={workspaceId}
+          workspaceName={workspace?.name ?? ''}
+          isDefaultWorkspace={workspace?.is_default ?? true}
+          folders={folders.folders.filter((f) => f.can_upload).map((f) => f.path)}
+          initialFolder={folderFilter}
           onCreated={() => { setShowCreate(false); loadDocuments() }}
           onRefresh={loadDocuments}
         />
@@ -211,13 +308,28 @@ export function DocumentsPage() {
         </select>
       </div>
 
+      {workspaceId && (
+        <FoldersPanel
+          workspaceId={workspaceId}
+          workspaceName={workspace?.name ?? ''}
+          selected={folderFilter}
+          includeSubfolders={includeSubfolders}
+          onSelect={setFolderFilter}
+          onIncludeSubfoldersChange={setIncludeSubfolders}
+          onChanged={loadDocuments}
+        />
+      )}
+
       <div className="card" style={{ marginBottom: 24 }}>
         {loading ? (
           <div className="centered-spinner">
             <div className="spinner" />
           </div>
         ) : documents.length === 0 ? (
-          <div className="empty-state">Aucun document accessible pour votre rôle.</div>
+          <div className="empty-state">
+            Aucun document accessible pour votre rôle dans l'espace de travail « {workspace?.name} ».
+            {workspace && !workspace.is_default && workspace.can_sync && ' Connectez son dossier depuis l\'Assistant IA pour le synchroniser.'}
+          </div>
         ) : filteredDocuments.length === 0 ? (
           <div className="empty-state">Aucun document ne correspond à ces filtres.</div>
         ) : (
@@ -228,6 +340,8 @@ export function DocumentsPage() {
                   <th>Titre</th>
                   <th>Département</th>
                   <th>Confidentialité</th>
+                  <th>Indexation</th>
+                  <th>Ajouté par</th>
                   <th>Ajouté le</th>
                 </tr>
               </thead>
@@ -239,7 +353,13 @@ export function DocumentsPage() {
                         {doc.source_filename && (
                           <span className="file-type-tag">{fileExt(doc.source_filename)}</span>
                         )}
-                        {doc.title}
+                        <span>
+                          {doc.title}
+                          {doc.relative_path && doc.relative_path !== doc.title && (
+                            <span className="doc-path"> — {workspace?.name}/{doc.relative_path}</span>
+                          )}
+                          {doc.subject_name && <span className="personal-tag">👤 {doc.subject_name}</span>}
+                        </span>
                       </div>
                     </td>
                     <td>
@@ -247,6 +367,14 @@ export function DocumentsPage() {
                     </td>
                     <td>
                       <ConfidentialityBadge level={doc.confidentiality} />
+                    </td>
+                    <td>
+                      <IndexStatus status={doc.status} progress={doc.index_progress} />
+                    </td>
+                    <td>
+                      {doc.added_by_name ?? '—'}
+                      {doc.origin === 'sync' && <div className="doc-origin">dossier synchronisé</div>}
+                      {doc.origin === 'upload' && <div className="doc-origin">déposé depuis l'application</div>}
                     </td>
                     <td>{new Date(doc.created_at).toLocaleDateString('fr-FR')}</td>
                   </tr>
@@ -291,6 +419,12 @@ export function DocumentsPage() {
                   <div style={{ marginTop: 6, display: 'flex', gap: 8, alignItems: 'center' }}>
                     <span className="dept-tag">{selected.department}</span>
                     <ConfidentialityBadge level={selected.confidentiality} />
+                    {selected.subject_name && (
+                      <span className="personal-tag">👤 Document personnel de {selected.subject_name}</span>
+                    )}
+                    {selected.added_by_name && (
+                      <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>Ajouté par {selected.added_by_name}</span>
+                    )}
                     {selected.source_filename && (
                       <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>{selected.source_filename}</span>
                     )}
@@ -346,6 +480,28 @@ export function DocumentsPage() {
                       </select>
                     </div>
                   </div>
+                  {isDirector && (
+                    <div className="field" style={{ marginBottom: 14 }}>
+                      <label className="field-label">Document personnel de</label>
+                      <select className="input" value={editSubject} onChange={(e) => setEditSubject(e.target.value)}>
+                        <option value="">— personne (document commun) —</option>
+                        {people.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.full_name} ({p.role})
+                          </option>
+                        ))}
+                      </select>
+                      <p className="workspace-hint" style={{ marginTop: 4 }}>
+                        Fiche de paie, congés, tâches… : l'employé le voit toujours, ses collègues jamais. Seuls les
+                        gestionnaires du département (RH pour HR, comptable pour FINANCE) et le directeur le voient.
+                      </p>
+                    </div>
+                  )}
+                  <p className="workspace-hint" style={{ marginBottom: 12 }}>
+                    Rappel : un utilisateur voit ce document seulement s'il a accès à son espace de travail{' '}
+                    <strong>et</strong> si son rôle l'autorise (département, niveau), s'il s'agit de son document
+                    personnel, ou si le directeur le lui a accordé (voir « Qui peut voir ce document ? »).
+                  </p>
                   <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
                     <button type="button" className="btn" onClick={() => setEditing(false)}>
                       Annuler
@@ -357,13 +513,34 @@ export function DocumentsPage() {
                 </div>
               ) : (
                 <>
-                  {selected?.source_filename && (
-                    <div className="hint-banner" style={{ marginBottom: 14 }}>
-                      Texte extrait automatiquement de « {selected.source_filename} » pour la recherche et
-                      l'assistant IA. Utilisez « Télécharger le fichier » pour le document original.
-                    </div>
+                  {selected && (
+                    <DocumentAccessPanel
+                      documentId={selected.id}
+                      refreshKey={`${selected.department}/${selected.confidentiality}/${selected.subject_user_id ?? ''}`}
+                      onWorkspaceChanged={() => void refreshWorkspaces()}
+                    />
                   )}
-                  {selected?.content}
+                  {selected && isImageFile(selected.file_mime_type, selected.source_filename) ? (
+                    <>
+                      <ImagePreview documentId={selected.id} alt={selected.source_filename ?? selected.title} />
+                      <h4 className="doc-extracted-title">Texte extrait (OCR)</h4>
+                      <p className="workspace-hint" style={{ marginBottom: 8 }}>
+                        Reconnu automatiquement dans l'image : c'est ce texte que la recherche et l'assistant IA
+                        utilisent.
+                      </p>
+                      <div className="doc-extracted-text">{selected.content}</div>
+                    </>
+                  ) : (
+                    <>
+                      {selected?.source_filename && (
+                        <div className="hint-banner" style={{ marginBottom: 14 }}>
+                          Texte extrait automatiquement de « {selected.source_filename} » pour la recherche et
+                          l'assistant IA. Utilisez « Télécharger le fichier » pour le document original.
+                        </div>
+                      )}
+                      {selected?.content}
+                    </>
+                  )}
                 </>
               )}
             </div>
@@ -372,6 +549,29 @@ export function DocumentsPage() {
       )}
     </div>
   )
+}
+
+function IndexStatus({ status, progress }: { status: string; progress: number | null }) {
+  if (status === 'indexed') return <span className="index-status index-ok">✓ Indexé</span>
+  if (status === 'indexing')
+    return (
+      <span className="index-status index-pending" title="Déjà lisible et trouvable par recherche exacte ; recherche par le sens en cours de préparation.">
+        ⟳ Indexation {progress ?? 0} %
+      </span>
+    )
+  if (status === 'queued' || status === 'extracting')
+    return (
+      <span className="index-status index-pending" title="Fichier copié dans ORBIT ; lecture du contenu (texte, OCR) en arrière-plan.">
+        ⟳ {status === 'queued' ? 'En attente de lecture' : 'Lecture en cours'}
+      </span>
+    )
+  if (status === 'failed')
+    return (
+      <span className="index-status index-error" title="Aucun texte n'a pu être extrait de ce fichier, même par OCR.">
+        ✗ Illisible
+      </span>
+    )
+  return <span className="index-status index-error">✗ Erreur</span>
 }
 
 function fileExt(filename: string): string {
@@ -390,8 +590,36 @@ function isSupported(filename: string): boolean {
   return ACCEPTED_EXTENSIONS.some((ext) => lower.endsWith(ext))
 }
 
-function CreateDocumentForm({ onCreated, onRefresh }: { onCreated: () => void; onRefresh: () => void }) {
+function joinFolder(...parts: string[]) {
+  return parts
+    .map((p) => p.replace(/^\/+|\/+$/g, ''))
+    .filter(Boolean)
+    .join('/')
+}
+
+function CreateDocumentForm({
+  workspaceId,
+  workspaceName,
+  isDefaultWorkspace,
+  folders,
+  initialFolder,
+  onCreated,
+  onRefresh,
+}: {
+  workspaceId: string | null
+  workspaceName: string
+  isDefaultWorkspace: boolean
+  /** Folders this user may drop files into. */
+  folders: string[]
+  initialFolder: string
+  onCreated: () => void
+  onRefresh: () => void
+}) {
   const [mode, setMode] = useState<'file' | 'folder' | 'text'>('file')
+  const [destination, setDestination] = useState(initialFolder)
+  const [newFolder, setNewFolder] = useState('')
+  // Chosen folder (+ a new subfolder typed under it), "" = root.
+  const targetFolder = joinFolder(destination === '__new__' ? '' : destination, newFolder)
   const [title, setTitle] = useState('')
   const [department, setDepartment] = useState(DEPARTMENTS[3])
   const [confidentiality, setConfidentiality] = useState(LEVELS[1])
@@ -431,7 +659,16 @@ function CreateDocumentForm({ onCreated, onRefresh }: { onCreated: () => void; o
         const f = folderFiles[i]
         setBatchProgress({ done: i, total: folderFiles.length })
         try {
-          await uploadDocument({ title: stripExtension(f.name), department, confidentiality, file: f })
+          // Keep the picked folder's own tree under the destination, like a Dropbox upload.
+          const subdir = (f.webkitRelativePath || '').split('/').slice(0, -1).join('/')
+          await uploadDocument({
+            title: stripExtension(f.name),
+            department,
+            confidentiality,
+            file: f,
+            workspaceId: workspaceId ?? undefined,
+            folder: joinFolder(targetFolder, subdir) || undefined,
+          })
         } catch (err) {
           failures.push({ name: f.name, error: err instanceof Error ? err.message : 'Erreur inconnue' })
         }
@@ -453,9 +690,16 @@ function CreateDocumentForm({ onCreated, onRefresh }: { onCreated: () => void; o
           setSaving(false)
           return
         }
-        await uploadDocument({ title, department, confidentiality, file })
+        await uploadDocument({
+          title,
+          department,
+          confidentiality,
+          file,
+          workspaceId: workspaceId ?? undefined,
+          folder: targetFolder || undefined,
+        })
       } else {
-        await createDocument({ title, department, confidentiality, content })
+        await createDocument({ title, department, confidentiality, content, workspace_id: workspaceId ?? undefined })
       }
       onCreated()
     } catch (err) {
@@ -467,7 +711,10 @@ function CreateDocumentForm({ onCreated, onRefresh }: { onCreated: () => void; o
 
   return (
     <div className="card card-pad" style={{ marginBottom: 20 }}>
-      <h3 style={{ marginBottom: 12 }}>Ajouter des documents</h3>
+      <h3 style={{ marginBottom: 4 }}>Ajouter des documents</h3>
+      <p className="workspace-hint" style={{ marginBottom: 12 }}>
+        Espace de travail cible : <strong>📁 {workspaceName}</strong> (changez-le en haut de la page).
+      </p>
 
       <div className="segmented">
         <button type="button" className={mode === 'file' ? 'active' : ''} onClick={() => setMode('file')}>
@@ -484,6 +731,40 @@ function CreateDocumentForm({ onCreated, onRefresh }: { onCreated: () => void; o
       {error && <div className="error-banner" style={{ marginTop: 14 }}>{error}</div>}
 
       <form onSubmit={handleSubmit} style={{ marginTop: 14 }}>
+        {mode !== 'text' && (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+            <div className="field">
+              <label className="field-label">Dossier de destination</label>
+              <select className="input" value={destination} onChange={(e) => setDestination(e.target.value)}>
+                <option value="">{isDefaultWorkspace ? '— aucun dossier —' : '📁 Racine de l\u2019espace'}</option>
+                {folders.map((f) => (
+                  <option key={f} value={f}>
+                    📂 {f}
+                  </option>
+                ))}
+                <option value="__new__">＋ Nouveau dossier…</option>
+              </select>
+            </div>
+            <div className="field">
+              <label className="field-label">
+                {destination === '__new__' ? 'Nom du nouveau dossier' : 'Sous-dossier (facultatif)'}
+              </label>
+              <input
+                className="input"
+                placeholder={destination === '__new__' ? 'ex. RH/Paie' : 'ex. 2026'}
+                value={newFolder}
+                onChange={(e) => setNewFolder(e.target.value)}
+              />
+            </div>
+          </div>
+        )}
+        {mode !== 'text' && (
+          <p className="workspace-hint" style={{ marginTop: -6, marginBottom: 14 }}>
+            Destination : <strong>📁 {workspaceName}{targetFolder ? ` / ${targetFolder}` : ''}</strong>. Le fichier
+            apparaît aussitôt pour chaque personne autorisée, avec votre nom. Astuce : un fichier déposé dans{' '}
+            <code>Personnel/&lt;identifiant&gt;</code> devient le document personnel de cette personne.
+          </p>
+        )}
         {mode !== 'folder' && (
           <div className="field">
             <label className="field-label">Titre</label>
@@ -535,7 +816,7 @@ function CreateDocumentForm({ onCreated, onRefresh }: { onCreated: () => void; o
             </label>
             <p style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 6 }}>
               Le texte est extrait automatiquement pour la recherche ; le fichier original reste téléchargeable
-              tel quel. Taille max. 20 Mo.
+              tel quel. Taille max. 50 Mo.
             </p>
           </div>
         )}
