@@ -39,3 +39,7 @@ class Alert(Base):
     # time, never updated. Nullable: CHAT_ACCESS_DENIED/DOCUMENT_ACCESS_DENIED
     # predate this column and have no corresponding audit row to point at.
     audit_log_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    # app/core/alert_service.py::security_event_key - the same refusal
+    # retried within the dedup window raises a single alert. Nullable:
+    # alerts that predate deduplication, and ones never deduplicated.
+    dedup_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
